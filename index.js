@@ -44,6 +44,7 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS invites (
       token TEXT PRIMARY KEY,
       student_id TEXT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+      short_code TEXT UNIQUE,
       used BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT NOW()
     );
@@ -159,9 +160,10 @@ app.post('/api/students', auth, teacherOnly, async (req, res) => {
     await pool.query('INSERT INTO students (id,name,initials,class_id,teacher_id,platform) VALUES ($1,$2,$3,$4,$5,$6)',
       [id, name, initials, classId, req.session.teacher_id, platform || 'iOS']);
     const inviteToken = genToken();
-    await pool.query('INSERT INTO invites (token,student_id) VALUES ($1,$2)', [inviteToken, id]);
+    const shortCode = Math.floor(100000 + Math.random() * 900000).toString();
+    await pool.query('INSERT INTO invites (token,student_id,short_code) VALUES ($1,$2,$3)', [inviteToken, id, shortCode]);
     const joinUrl = `screentime://join/${inviteToken}`;
-    res.json({ok: true, student: {id, name, classId}, joinUrl});
+    res.json({ok: true, student: {id, name, classId}, joinUrl, shortCode});
   } catch(e) { res.status(500).json({error: e.message}); }
 });
 
@@ -191,6 +193,18 @@ app.delete('/api/students/:id', auth, teacherOnly, async (req, res) => {
   try {
     await pool.query('DELETE FROM students WHERE id=$1 AND teacher_id=$2', [req.params.id, req.session.teacher_id]);
     res.json({ok: true});
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+// ─── חיפוש לפי קוד קצר ───────────────────────────────────────────────────────
+app.get('/api/join/code/:shortCode', async (req, res) => {
+  try {
+    const inv = await pool.query('SELECT * FROM invites WHERE short_code=$1 AND used=FALSE', [req.params.shortCode]);
+    if (!inv.rows.length) return res.status(404).json({error: 'קוד לא תקף או שכבר נוצל'});
+    const s = await pool.query('SELECT s.*, c.name as class_name, t.name as teacher_name FROM students s LEFT JOIN classes c ON s.class_id=c.id LEFT JOIN teachers t ON s.teacher_id=t.id WHERE s.id=$1', [inv.rows[0].student_id]);
+    if (!s.rows.length) return res.status(404).json({error: 'תלמיד לא נמצא'});
+    const student = s.rows[0];
+    res.json({ok: true, token: inv.rows[0].token, studentName: student.name, className: student.class_name || '', teacherName: student.teacher_name || ''});
   } catch(e) { res.status(500).json({error: e.message}); }
 });
 
