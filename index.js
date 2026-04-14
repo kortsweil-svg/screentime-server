@@ -88,7 +88,7 @@ app.post('/api/students',auth,teacherOnly,(req,res)=>{
   // קישור הצטרפות חד-פעמי
   const inviteToken=token();
   invites[inviteToken]={studentId:sid,used:false,createdAt:new Date().toISOString()};
-  const joinUrl=`${req.headers.origin||'https://screentime-server.onrender.com'}/join/${inviteToken}`;
+  const joinUrl=`https://screentime-server.onrender.com/join/${inviteToken}`;
   res.json({ok:true,student:{id:sid,name,classId},joinUrl});
 });
 
