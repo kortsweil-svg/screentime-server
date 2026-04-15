@@ -172,7 +172,7 @@ app.post('/api/student/login', async (req, res) => {
 app.get('/api/students', auth, teacherOnly, async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT s.*, r.daily_average, r.weekly_data, r.synced_at
+      SELECT s.*, r.daily_average, r.weekly_data, r.by_app, r.timing, r.synced_at
       FROM students s
       LEFT JOIN reports r ON s.id = r.student_id
       WHERE s.teacher_id = $1
