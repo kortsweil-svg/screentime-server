@@ -261,4 +261,15 @@ app.get('/api/report', auth, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-initDB().then(() => app.listen(PORT, () => console.log(`Server on port ${PORT}`))).catch(console.error);
+initDB().then(() => {
+  app.listen(PORT, () => console.log(`Server on port ${PORT}`));
+  const SIX_DAYS = 6 * 24 * 60 * 60 * 1000;
+  setInterval(async () => {
+    try {
+      await pool.query('SELECT 1');
+      console.log('[ping] Supabase kept alive');
+    } catch(e) {
+      console.log('[ping] error:', e.message);
+    }
+  }, SIX_DAYS);
+}).catch(console.error);
