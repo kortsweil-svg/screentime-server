@@ -317,7 +317,6 @@ app.post('/api/report', auth, async (req, res) => {
         syncedAt || new Date().toISOString()]);
 
     // שמירה להיסטוריה יומית
-   console.log('[history] saving for date:', today, 'student:', req.session.user_id);
     const today = new Date().toISOString().split('T')[0];
     const histId = genId();
     await pool.query(`
@@ -332,7 +331,10 @@ app.post('/api/report', auth, async (req, res) => {
         today, syncedAt||new Date().toISOString()]);
 
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { 
+    console.error('[report] error:', e.message);
+    res.status(500).json({ error: e.message }); 
+  }
 });
 
 app.get('/api/report', auth, async (req, res) => {
