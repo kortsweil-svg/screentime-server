@@ -246,17 +246,30 @@ app.delete('/api/students/:id', auth, teacherOnly, async (req, res) => {
 // ─── היסטוריה ────────────────────────────────────────────────────────────────
 app.get('/api/history', auth, teacherOnly, async (req, res) => {
   try {
-    const { weeks } = req.query;
-    const weeksBack = parseInt(weeks) || 4;
+    const { range } = req.query;
+    let fromDate;
+    const now = new Date();
+    const today = now.toISOString().split('T')[0];
+    const yesterday = new Date(now); yesterday.setDate(yesterday.getDate()-1);
+    const yesterdayStr = yesterday.toISOString().split('T')[0];
+
+    if (range === 'today') fromDate = today;
+    else if (range === 'yesterday') fromDate = yesterdayStr;
+    else if (range === '7d') { const d=new Date(now); d.setDate(d.getDate()-7); fromDate=d.toISOString().split('T')[0]; }
+    else if (range === '30d') { const d=new Date(now); d.setDate(d.getDate()-30); fromDate=d.toISOString().split('T')[0]; }
+    else if (range === '90d') { const d=new Date(now); d.setDate(d.getDate()-90); fromDate=d.toISOString().split('T')[0]; }
+    else if (range === '180d') { const d=new Date(now); d.setDate(d.getDate()-180); fromDate=d.toISOString().split('T')[0]; }
+    else if (range === '365d') { const d=new Date(now); d.setDate(d.getDate()-365); fromDate=d.toISOString().split('T')[0]; }
+    else fromDate = '2020-01-01'; // מאז תמיד
+
     const r = await pool.query(`
-      SELECT s.id, s.name, s.class_name, h.daily_average, h.weekly_data, h.by_app, h.week_start
+      SELECT s.id, s.name, s.class_name, h.daily_average, h.weekly_data, h.by_app, h.report_date, h.synced_at
       FROM students s
-      LEFT JOIN reports_history h ON s.id = h.student_id
+      LEFT JOIN reports_history h ON s.id = h.student_id AND h.report_date >= $2
       WHERE s.teacher_id = $1
-        AND (h.week_start IS NULL OR h.week_start >= (CURRENT_DATE - INTERVAL '${weeksBack} weeks')::TEXT)
-      ORDER BY s.class_name, s.name, h.week_start DESC
-    `, [req.session.teacher_id]);
-    res.json(r.rows);
+      ORDER BY s.class_name, s.name, h.report_date DESC
+    `, [req.session.teacher_id, fromDate]);
+    res.json({ rows: r.rows, range, fromDate, today, yesterday: yesterdayStr });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -303,20 +316,19 @@ app.post('/api/report', auth, async (req, res) => {
         JSON.stringify(consent || {}), platform || 'unknown',
         syncedAt || new Date().toISOString()]);
 
-    // שמירה להיסטוריה
-    const weekStart = new Date();
-    weekStart.setDate(weekStart.getDate() - weekStart.getDay());
-    const weekStartStr = weekStart.toISOString().split('T')[0];
+    // שמירה להיסטוריה יומית
+    const today = new Date().toISOString().split('T')[0];
     const histId = genId();
     await pool.query(`
-      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, week_start, synced_at)
+      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, report_date, synced_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-      ON CONFLICT DO NOTHING
+      ON CONFLICT (student_id, report_date) DO UPDATE SET
+        daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$11
     `, [histId, req.session.user_id, dailyAverage||0, totalMinutes||0,
         JSON.stringify(weeklyData||[0,0,0,0,0,0,0]),
         JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
         JSON.stringify(consent||{}), platform||'unknown',
-        weekStartStr, syncedAt||new Date().toISOString()]);
+        today, syncedAt||new Date().toISOString()]);
 
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
