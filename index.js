@@ -243,6 +243,23 @@ app.delete('/api/students/:id', auth, teacherOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── היסטוריה ────────────────────────────────────────────────────────────────
+app.get('/api/history', auth, teacherOnly, async (req, res) => {
+  try {
+    const { weeks } = req.query;
+    const weeksBack = parseInt(weeks) || 4;
+    const r = await pool.query(`
+      SELECT s.id, s.name, s.class_name, h.daily_average, h.weekly_data, h.by_app, h.week_start
+      FROM students s
+      LEFT JOIN reports_history h ON s.id = h.student_id
+      WHERE s.teacher_id = $1
+        AND (h.week_start IS NULL OR h.week_start >= (CURRENT_DATE - INTERVAL '${weeksBack} weeks')::TEXT)
+      ORDER BY s.class_name, s.name, h.week_start DESC
+    `, [req.session.teacher_id]);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ─── מצב רוח ─────────────────────────────────────────────────────────────────
 app.post('/api/mood', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
@@ -285,6 +302,22 @@ app.post('/api/report', auth, async (req, res) => {
         JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
         JSON.stringify(consent || {}), platform || 'unknown',
         syncedAt || new Date().toISOString()]);
+
+    // שמירה להיסטוריה
+    const weekStart = new Date();
+    weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+    const weekStartStr = weekStart.toISOString().split('T')[0];
+    const histId = genId();
+    await pool.query(`
+      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, week_start, synced_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      ON CONFLICT DO NOTHING
+    `, [histId, req.session.user_id, dailyAverage||0, totalMinutes||0,
+        JSON.stringify(weeklyData||[0,0,0,0,0,0,0]),
+        JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
+        JSON.stringify(consent||{}), platform||'unknown',
+        weekStartStr, syncedAt||new Date().toISOString()]);
+
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
