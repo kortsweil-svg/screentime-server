@@ -57,6 +57,14 @@ async function initDB() {
       teacher_id TEXT NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS mood_checks (
+      id TEXT PRIMARY KEY,
+      student_id TEXT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+      mood TEXT NOT NULL,
+      date TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(student_id, date)
+    );
   `);
   console.log('DB ready');
 }
@@ -204,13 +212,15 @@ app.post('/api/student/login', async (req, res) => {
 // ─── תלמידים (למורה) ─────────────────────────────────────────────────────────
 app.get('/api/students', auth, teacherOnly, async (req, res) => {
   try {
+    const today = new Date().toISOString().split('T')[0];
     const r = await pool.query(`
-      SELECT s.*, r.daily_average, r.weekly_data, r.by_app, r.timing, r.synced_at
+      SELECT s.*, r.daily_average, r.weekly_data, r.by_app, r.timing, r.synced_at, m.mood
       FROM students s
       LEFT JOIN reports r ON s.id = r.student_id
+      LEFT JOIN mood_checks m ON s.id = m.student_id AND m.date = $2
       WHERE s.teacher_id = $1
       ORDER BY s.class_name, s.name
-    `, [req.session.teacher_id]);
+    `, [req.session.teacher_id, today]);
     res.json(r.rows.map(s => ({
       id: s.id, name: s.name,
       initials: s.name.split(' ').map((w) => w[0]).join('').slice(0, 2),
@@ -221,6 +231,7 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
       byApp: s.by_app || {},
       timing: s.timing || {},
       lastSync: s.synced_at || null,
+      mood: s.mood || null,
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -230,6 +241,32 @@ app.delete('/api/students/:id', auth, teacherOnly, async (req, res) => {
     await pool.query('DELETE FROM students WHERE id=$1 AND teacher_id=$2', [req.params.id, req.session.teacher_id]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── מצב רוח ─────────────────────────────────────────────────────────────────
+app.post('/api/mood', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  const { mood } = req.body;
+  if (!['good','neutral','bad'].includes(mood)) return res.status(400).json({ error: 'מצב רוח לא תקף' });
+  const date = new Date().toISOString().split('T')[0];
+  const id = genId();
+  try {
+    await pool.query(`
+      INSERT INTO mood_checks (id, student_id, mood, date)
+      VALUES ($1,$2,$3,$4)
+      ON CONFLICT (student_id, date) DO UPDATE SET mood=$3
+    `, [id, req.session.user_id, mood, date]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/mood/today', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  const date = new Date().toISOString().split('T')[0];
+  try {
+    const r = await pool.query('SELECT mood FROM mood_checks WHERE student_id=$1 AND date=$2', [req.session.user_id, date]);
+    res.json({ mood: r.rows[0]?.mood || null });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── דוחות ───────────────────────────────────────────────────────────────────
