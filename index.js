@@ -323,7 +323,7 @@ app.post('/api/report', auth, async (req, res) => {
       INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, report_date, synced_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
-        daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$11
+        daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data, by_app=EXCLUDED.by_app, timing=EXCLUDED.timing, consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at
     `, [histId, req.session.user_id, parseFloat(dailyAverage)||0, parseInt(totalMinutes)||0,
         JSON.stringify(weeklyData||[0,0,0,0,0,0,0]),
         JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
