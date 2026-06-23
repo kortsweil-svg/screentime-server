@@ -317,6 +317,7 @@ app.post('/api/report', auth, async (req, res) => {
         syncedAt || new Date().toISOString()]);
 
     // שמירה להיסטוריה יומית
+   console.log('[history] saving for date:', today, 'student:', req.session.user_id);
     const today = new Date().toISOString().split('T')[0];
     const histId = genId();
     await pool.query(`
