@@ -308,6 +308,29 @@ app.get('/api/history', auth, teacherOnly, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── ממוצע כיתתי ─────────────────────────────────────────────────────────────
+app.get('/api/class-average', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    // קבל את הכיתה של התלמיד
+    const student = await pool.query('SELECT class_name, teacher_id FROM students WHERE id=$1', [req.session.user_id]);
+    if (!student.rows.length) return res.status(404).json({ error: 'תלמיד לא נמצא' });
+    const { class_name, teacher_id } = student.rows[0];
+
+    // חשב ממוצע של כל התלמידים בכיתה
+    const r = await pool.query(`
+      SELECT AVG(r.daily_average) as class_avg, COUNT(s.id) as student_count
+      FROM students s
+      LEFT JOIN reports r ON s.id = r.student_id
+      WHERE s.teacher_id = $1 AND s.class_name = $2 AND r.daily_average > 0
+    `, [teacher_id, class_name]);
+
+    const classAvg = parseFloat(r.rows[0]?.class_avg) || 0;
+    const studentCount = parseInt(r.rows[0]?.student_count) || 0;
+    res.json({ classAvg, studentCount, className: class_name });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ─── מצב רוח ─────────────────────────────────────────────────────────────────
 app.post('/api/mood', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
