@@ -298,7 +298,7 @@ app.get('/api/history', auth, teacherOnly, async (req, res) => {
     else fromDate = '2020-01-01'; // מאז תמיד
 
     const r = await pool.query(`
-      SELECT s.id, s.name, s.class_name, h.daily_average, h.weekly_data, h.by_app, h.report_date, h.synced_at
+      SELECT s.id, s.name, s.class_name, h.daily_average, h.weekly_data, h.by_app, h.timing, h.report_date, h.synced_at
       FROM students s
       LEFT JOIN reports_history h ON s.id = h.student_id AND h.report_date >= $2
       WHERE s.teacher_id = $1
