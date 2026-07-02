@@ -214,7 +214,7 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     const r = await pool.query(`
-      SELECT s.*, r.daily_average, r.weekly_data, r.by_app, r.timing, r.synced_at, m.mood
+      SELECT s.*, r.daily_average, r.weekly_data, r.by_app, r.timing, r.synced_at, r.session_count, r.avg_session_seconds, m.mood
       FROM students s
       LEFT JOIN reports r ON s.id = r.student_id
       LEFT JOIN mood_checks m ON s.id = m.student_id AND m.date = $2
@@ -232,6 +232,8 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
       timing: s.timing || {},
       lastSync: s.synced_at || null,
       mood: s.mood || null,
+      sessionCount: s.session_count || 0,
+      avgSessionSeconds: s.avg_session_seconds || 0,
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -364,29 +366,31 @@ app.post('/api/report', auth, async (req, res) => {
   try {
     if (consent) await pool.query('UPDATE students SET consent=$1 WHERE id=$2', [consent.total || false, req.session.user_id]);
     await pool.query(`
-      INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, synced_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, synced_at, session_count, avg_session_seconds)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
       ON CONFLICT (student_id) DO UPDATE SET
-        daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$9
+        daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$9, session_count=$10, avg_session_seconds=$11
     `, [req.session.user_id, dailyAverage || 0, totalMinutes || 0,
         JSON.stringify(weeklyData || [0,0,0,0,0,0,0]),
         JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
         JSON.stringify(consent || {}), platform || 'unknown',
-        syncedAt || new Date().toISOString()]);
+        syncedAt || new Date().toISOString(),
+        parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0]);
 
     // שמירה להיסטוריה יומית
     const today = new Date().toISOString().split('T')[0];
     const histId = genId();
     await pool.query(`
-      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, report_date, synced_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, report_date, synced_at, session_count, avg_session_seconds)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
-        daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data, by_app=EXCLUDED.by_app, timing=EXCLUDED.timing, consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at
+        daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data, by_app=EXCLUDED.by_app, timing=EXCLUDED.timing, consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at, session_count=EXCLUDED.session_count, avg_session_seconds=EXCLUDED.avg_session_seconds
     `, [histId, req.session.user_id, parseFloat(dailyAverage)||0, parseInt(totalMinutes)||0,
         JSON.stringify(weeklyData||[0,0,0,0,0,0,0]),
         JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
         JSON.stringify(consent||{}), platform||'unknown',
-        today, syncedAt||new Date().toISOString()]);
+        today, syncedAt||new Date().toISOString(),
+        parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0]);
 
     res.json({ ok: true });
   } catch (e) { 
