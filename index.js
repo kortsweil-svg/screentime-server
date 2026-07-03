@@ -258,6 +258,8 @@ app.get('/api/students/range', auth, teacherOnly, async (req, res) => {
         AVG(h.daily_average) as avg_hours,
         SUM(h.total_minutes) as total_minutes,
         COUNT(h.report_date) as days_count,
+        SUM(h.session_count) as session_count,
+        AVG(NULLIF(h.avg_session_seconds,0)) as avg_session_seconds,
         MAX(h.synced_at) as last_sync
       FROM students s
       LEFT JOIN reports_history h ON s.id = h.student_id
@@ -275,6 +277,8 @@ app.get('/api/students/range', auth, teacherOnly, async (req, res) => {
       hours: parseFloat(s.avg_hours) || 0,
       totalMinutes: parseInt(s.total_minutes) || 0,
       daysCount: parseInt(s.days_count) || 0,
+      sessionCount: parseInt(s.session_count) || 0,
+      avgSessionSeconds: Math.round(parseFloat(s.avg_session_seconds) || 0),
       lastSync: s.last_sync || null,
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
