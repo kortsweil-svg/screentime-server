@@ -50,6 +50,8 @@ async function initDB() {
     );
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS by_app JSONB DEFAULT '{}';
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS timing JSONB DEFAULT '{}';
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS push_status TEXT;
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS push_sent_at TIMESTAMP;
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -214,7 +216,7 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     const r = await pool.query(`
-      SELECT s.*, r.daily_average, r.weekly_data, r.by_app, r.timing, r.synced_at, r.session_count, r.avg_session_seconds, m.mood
+      SELECT s.*, r.daily_average, r.weekly_data, r.by_app, r.timing, r.synced_at, r.session_count, r.avg_session_seconds, r.push_status, r.push_sent_at, m.mood
       FROM students s
       LEFT JOIN reports r ON s.id = r.student_id
       LEFT JOIN mood_checks m ON s.id = m.student_id AND m.date = $2
@@ -234,6 +236,8 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
       mood: s.mood || null,
       sessionCount: s.session_count || 0,
       avgSessionSeconds: s.avg_session_seconds || 0,
+      pushStatus: s.push_status || null,
+      pushSentAt: s.push_sent_at || null,
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -366,20 +370,21 @@ app.get('/api/mood/today', auth, async (req, res) => {
 // ─── דוחות ───────────────────────────────────────────────────────────────────
 app.post('/api/report', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
-  const { dailyAverage, totalMinutes, weeklyData, consent, platform, syncedAt } = req.body;
+  const { dailyAverage, totalMinutes, weeklyData, consent, platform, syncedAt, pushStatus, pushSentAt } = req.body;
   try {
     if (consent) await pool.query('UPDATE students SET consent=$1 WHERE id=$2', [consent.total || false, req.session.user_id]);
     await pool.query(`
-      INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, synced_at, session_count, avg_session_seconds)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, synced_at, session_count, avg_session_seconds, push_status, push_sent_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       ON CONFLICT (student_id) DO UPDATE SET
-        daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$9, session_count=$10, avg_session_seconds=$11
+        daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$9, session_count=$10, avg_session_seconds=$11, push_status=$12, push_sent_at=$13
     `, [req.session.user_id, dailyAverage || 0, totalMinutes || 0,
         JSON.stringify(weeklyData || [0,0,0,0,0,0,0]),
         JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
         JSON.stringify(consent || {}), platform || 'unknown',
         syncedAt || new Date().toISOString(),
-        parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0]);
+        parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
+        pushStatus || null, pushSentAt || null]);
 
     // שמירה להיסטוריה יומית
     const today = new Date().toISOString().split('T')[0];
