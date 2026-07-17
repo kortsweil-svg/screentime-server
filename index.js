@@ -2,10 +2,29 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const { Pool } = require('pg');
+const admin = require('firebase-admin');
 const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+// ── אתחול Firebase Admin (לשליחת הודעות FCM) ──
+// המפתח הסודי נשמר כמשתנה סביבה ב-Render (FIREBASE_SERVICE_ACCOUNT) - לא בקוד.
+let firebaseReady = false;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    firebaseReady = true;
+    console.log('[Firebase] initialized OK');
+  } else {
+    console.log('[Firebase] FIREBASE_SERVICE_ACCOUNT not set - FCM disabled');
+  }
+} catch (e) {
+  console.log('[Firebase] init error:', e.message);
+}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://postgres.uzuluwhuvthpynoazaor:A13!039097518@aws-1-eu-west-2.pooler.supabase.com:6543/postgres',
@@ -37,6 +56,7 @@ async function initDB() {
       active BOOLEAN DEFAULT TRUE,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    ALTER TABLE students ADD COLUMN IF NOT EXISTS fcm_token TEXT;
     CREATE TABLE IF NOT EXISTS reports (
       student_id TEXT PRIMARY KEY REFERENCES students(id) ON DELETE CASCADE,
       daily_average NUMERIC DEFAULT 0,
@@ -416,6 +436,75 @@ app.get('/api/report', auth, async (req, res) => {
     const r = await pool.query('SELECT * FROM reports WHERE student_id=$1', [req.session.user_id]);
     res.json(r.rows[0] || {});
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── שמירת טוקן FCM של תלמיד ──
+app.post('/api/update-fcm-token', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  const { fcmToken } = req.body;
+  if (!fcmToken) return res.status(400).json({ error: 'חסר טוקן' });
+  try {
+    await pool.query('UPDATE students SET fcm_token=$1 WHERE id=$2', [fcmToken, req.session.user_id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── שליחת הודעת FCM שקטה (data message) לכל התלמידים ──
+// ההודעה מעירה את האפליקציה על המכשיר, והיא קוראת זמן מסך טרי ומציגה פוש מקומי.
+// מופעל על ידי שירות תזמון חיצוני (cron-job.org) ב-12:00 וב-20:00.
+// מוגן בסוד פשוט (CRON_SECRET) כדי שלא כל אחד יוכל להפעיל.
+async function sendSilentPushToAll(period) {
+  if (!firebaseReady) {
+    console.log('[FCM] skipped - firebase not ready');
+    return { sent: 0, failed: 0, error: 'firebase not ready' };
+  }
+  const r = await pool.query("SELECT id, fcm_token FROM students WHERE fcm_token IS NOT NULL AND active=TRUE");
+  let sent = 0, failed = 0;
+  const invalidTokens = [];
+
+  for (const student of r.rows) {
+    try {
+      await admin.messaging().send({
+        token: student.fcm_token,
+        data: { type: 'daily_sync', period: period || 'noon' },
+        android: {
+          priority: 'high', // חשוב: מבטיח שההודעה תעיר את האפליקציה גם במצב חיסכון
+        },
+      });
+      sent++;
+    } catch (e) {
+      failed++;
+      // אם הטוקן לא תקף יותר (המשתמש הסיר את האפליקציה) - נסמן למחיקה
+      if (e.code === 'messaging/registration-token-not-registered' ||
+          e.code === 'messaging/invalid-registration-token') {
+        invalidTokens.push(student.id);
+      }
+    }
+  }
+
+  // ניקוי טוקנים לא תקפים
+  if (invalidTokens.length) {
+    await pool.query('UPDATE students SET fcm_token=NULL WHERE id = ANY($1)', [invalidTokens]);
+  }
+
+  console.log(`[FCM] period=${period} sent=${sent} failed=${failed} cleaned=${invalidTokens.length}`);
+  return { sent, failed, cleaned: invalidTokens.length };
+}
+
+app.post('/api/send-daily-push', async (req, res) => {
+  // הגנה: רק מי שיודע את הסוד יכול להפעיל (מוגדר כמשתנה סביבה ב-Render)
+  const secret = req.headers['x-cron-secret'] || req.query.secret;
+  if (process.env.CRON_SECRET && secret !== process.env.CRON_SECRET) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const period = req.query.period || req.body?.period || 'noon';
+  try {
+    const result = await sendSilentPushToAll(period);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.log('[send-daily-push] error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 const PORT = process.env.PORT || 3001;
