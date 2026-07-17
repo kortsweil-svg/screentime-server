@@ -469,6 +469,8 @@ async function sendSilentPushToAll(period) {
         data: { type: 'daily_sync', period: period || 'noon' },
         android: {
           priority: 'high', // חשוב: מבטיח שההודעה תעיר את האפליקציה גם במצב חיסכון
+          ttl: 30 * 60 * 1000, // תוקף חצי שעה (במילישניות): אם המכשיר לא זמין תוך 30 דקות,
+                               // ההודעה מתבטלת ולא נמסרת מאוחר (למשל פוש שבת שיגיע במוצ"ש).
         },
       });
       sent++;
@@ -491,10 +493,9 @@ async function sendSilentPushToAll(period) {
   return { sent, failed, cleaned: invalidTokens.length };
 }
 
-// שונה ל-app.all כדי לתמוך גם ב-GET (מהדפדפן) וגם ב-POST (מ-cron-job.org)
-app.all('/api/send-daily-push', async (req, res) => {
+app.post('/api/send-daily-push', async (req, res) => {
   // הגנה: רק מי שיודע את הסוד יכול להפעיל (מוגדר כמשתנה סביבה ב-Render)
-  const secret = req.headers['x-cron-secret'] || req.query.secret || req.body?.secret;
+  const secret = req.headers['x-cron-secret'] || req.query.secret;
   if (process.env.CRON_SECRET && secret !== process.env.CRON_SECRET) {
     return res.status(403).json({ error: 'forbidden' });
   }
