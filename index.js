@@ -491,9 +491,10 @@ async function sendSilentPushToAll(period) {
   return { sent, failed, cleaned: invalidTokens.length };
 }
 
-app.post('/api/send-daily-push', async (req, res) => {
+// שונה ל-app.all כדי לתמוך גם ב-GET (מהדפדפן) וגם ב-POST (מ-cron-job.org)
+app.all('/api/send-daily-push', async (req, res) => {
   // הגנה: רק מי שיודע את הסוד יכול להפעיל (מוגדר כמשתנה סביבה ב-Render)
-  const secret = req.headers['x-cron-secret'] || req.query.secret;
+  const secret = req.headers['x-cron-secret'] || req.query.secret || req.body?.secret;
   if (process.env.CRON_SECRET && secret !== process.env.CRON_SECRET) {
     return res.status(403).json({ error: 'forbidden' });
   }
