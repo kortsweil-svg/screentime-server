@@ -73,6 +73,7 @@ async function initDB() {
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS push_status TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS push_sent_at TIMESTAMP;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS sync_source TEXT;
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS app_version TEXT;
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -392,21 +393,21 @@ app.get('/api/mood/today', auth, async (req, res) => {
 // ─── דוחות ───────────────────────────────────────────────────────────────────
 app.post('/api/report', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
-  const { dailyAverage, totalMinutes, weeklyData, consent, platform, syncedAt, pushStatus, pushSentAt, syncSource } = req.body;
+  const { dailyAverage, totalMinutes, weeklyData, consent, platform, syncedAt, pushStatus, pushSentAt, syncSource, appVersion } = req.body;
   try {
     if (consent) await pool.query('UPDATE students SET consent=$1 WHERE id=$2', [consent.total || false, req.session.user_id]);
     await pool.query(`
-      INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, synced_at, session_count, avg_session_seconds, push_status, push_sent_at, sync_source)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, synced_at, session_count, avg_session_seconds, push_status, push_sent_at, sync_source, app_version)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
       ON CONFLICT (student_id) DO UPDATE SET
-        daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$9, session_count=$10, avg_session_seconds=$11, push_status=$12, push_sent_at=$13, sync_source=$14
+        daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$9, session_count=$10, avg_session_seconds=$11, push_status=$12, push_sent_at=$13, sync_source=$14, app_version=$15
     `, [req.session.user_id, dailyAverage || 0, totalMinutes || 0,
         JSON.stringify(weeklyData || [0,0,0,0,0,0,0]),
         JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
         JSON.stringify(consent || {}), platform || 'unknown',
         syncedAt || new Date().toISOString(),
         parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
-        pushStatus || null, pushSentAt || null, syncSource || null]);
+        pushStatus || null, pushSentAt || null, syncSource || null, appVersion || null]);
 
     // שמירה להיסטוריה יומית
     const today = new Date().toISOString().split('T')[0];
@@ -507,6 +508,14 @@ app.post('/api/send-daily-push', async (req, res) => {
     console.log('[send-daily-push] error:', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── בדיקת גרסה מינימלית נדרשת ──
+// האפליקציה שואלת בפתיחה. השרת מחזיר את הגרסה המינימלית שמותר לעבוד איתה.
+// כדי לחייב עדכון - פשוט משנים כאן את המספר (או דרך משתנה סביבה MIN_APP_VERSION ב-Render).
+app.get('/api/min-version', (req, res) => {
+  const minVersion = process.env.MIN_APP_VERSION || '5.0';
+  res.json({ minVersion, storeUrl: 'https://play.google.com/store/apps/details?id=com.screentimestudent2' });
 });
 
 const PORT = process.env.PORT || 3001;
