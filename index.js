@@ -494,7 +494,9 @@ async function sendSilentPushToAll(period) {
   return { sent, failed, cleaned: invalidTokens.length };
 }
 
-app.post('/api/send-daily-push', async (req, res) => {
+// app.all - הנתיב מקבל גם GET וגם POST (וכל שיטה). כך ה-cron עובד בכל הגדרה,
+// ואפשר גם לבדוק ידנית מהדפדפן (GET). ה-secret וה-period נקראים גם מה-query וגם מה-body.
+app.all('/api/send-daily-push', async (req, res) => {
   // הגנה: רק מי שיודע את הסוד יכול להפעיל (מוגדר כמשתנה סביבה ב-Render)
   const secret = req.headers['x-cron-secret'] || req.query.secret;
   if (process.env.CRON_SECRET && secret !== process.env.CRON_SECRET) {
