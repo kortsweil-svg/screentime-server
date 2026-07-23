@@ -238,7 +238,8 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     const r = await pool.query(`
-      SELECT s.*, r.goal_hours, r.overall_goal_passed, r.wellness_score, r.synced_at, r.push_status, r.push_sent_at, r.sync_source, m.mood
+      SELECT s.*, r.daily_average, r.weekly_data, r.by_app, r.timing, r.synced_at, r.session_count, r.avg_session_seconds, r.push_status, r.push_sent_at, r.sync_source,
+             r.goal_hours, r.overall_goal_passed, r.wellness_score, m.mood
       FROM students s
       LEFT JOIN reports r ON s.id = r.student_id
       LEFT JOIN mood_checks m ON s.id = m.student_id AND m.date = $2
@@ -250,14 +251,21 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
       initials: s.name.split(' ').map((w) => w[0]).join('').slice(0, 2),
       className: s.class_name,
       platform: 'android', consent: s.consent, active: s.active,
-      goalHours: s.goal_hours !== null ? parseFloat(s.goal_hours) : null,
-      overallGoalPassed: s.overall_goal_passed,
-      wellnessScore: s.wellness_score,
+      hours: parseFloat(s.daily_average) || 0,
+      weeklyData: s.weekly_data || [0,0,0,0,0,0,0],
+      byApp: s.by_app || {},
+      timing: s.timing || {},
       lastSync: s.synced_at || null,
       mood: s.mood || null,
+      sessionCount: s.session_count || 0,
+      avgSessionSeconds: s.avg_session_seconds || 0,
       pushStatus: s.push_status || null,
       pushSentAt: s.push_sent_at || null,
       syncSource: s.sync_source || null,
+      // ── חדש בגרסה 6.0 - שדות נוספים, לצד הישנים, לא במקומם ──
+      goalHours: s.goal_hours !== null ? parseFloat(s.goal_hours) : null,
+      overallGoalPassed: s.overall_goal_passed,
+      wellnessScore: s.wellness_score,
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -279,8 +287,12 @@ app.get('/api/students/range', auth, teacherOnly, async (req, res) => {
 
     const r = await pool.query(`
       SELECT s.id, s.name, s.class_name, s.consent,
-        AVG(h.wellness_score) as avg_wellness_score,
+        AVG(h.daily_average) as avg_hours,
+        SUM(h.total_minutes) as total_minutes,
         COUNT(h.report_date) as days_count,
+        SUM(h.session_count) as session_count,
+        AVG(NULLIF(h.avg_session_seconds,0)) as avg_session_seconds,
+        AVG(h.wellness_score) as avg_wellness_score,
         COUNT(h.report_date) FILTER (WHERE h.overall_goal_passed) as days_goal_passed,
         MAX(h.synced_at) as last_sync
       FROM students s
@@ -296,10 +308,15 @@ app.get('/api/students/range', auth, teacherOnly, async (req, res) => {
       initials: s.name.split(' ').map((w) => w[0]).join('').slice(0, 2),
       className: s.class_name,
       consent: s.consent,
-      avgWellnessScore: Math.round(parseFloat(s.avg_wellness_score)) || null,
+      hours: parseFloat(s.avg_hours) || 0,
+      totalMinutes: parseInt(s.total_minutes) || 0,
       daysCount: parseInt(s.days_count) || 0,
-      daysGoalPassed: parseInt(s.days_goal_passed) || 0,
+      sessionCount: parseInt(s.session_count) || 0,
+      avgSessionSeconds: Math.round(parseFloat(s.avg_session_seconds) || 0),
       lastSync: s.last_sync || null,
+      // ── חדש בגרסה 6.0 ──
+      avgWellnessScore: Math.round(parseFloat(s.avg_wellness_score)) || null,
+      daysGoalPassed: parseInt(s.days_goal_passed) || 0,
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -324,7 +341,8 @@ app.get('/api/history', auth, teacherOnly, async (req, res) => {
     else fromDate = '2020-01-01'; // מאז תמיד
 
     const r = await pool.query(`
-      SELECT s.id, s.name, s.class_name, h.goal_hours, h.overall_goal_passed, h.wellness_score, h.report_date, h.synced_at
+      SELECT s.id, s.name, s.class_name, h.daily_average, h.weekly_data, h.by_app, h.timing, h.report_date, h.synced_at,
+             h.goal_hours, h.overall_goal_passed, h.wellness_score
       FROM students s
       LEFT JOIN reports_history h ON s.id = h.student_id AND h.report_date >= $2
       WHERE s.teacher_id = $1
@@ -389,21 +407,20 @@ app.post('/api/report', auth, async (req, res) => {
   const {
     dailyAverage, totalMinutes, weeklyData, consent, platform,
     syncedAt, pushStatus, pushSentAt, syncSource, appVersion,
-    goalHours, overallGoalPassed, wellnessScore,
+    goalHours, overallGoalPassed, wellnessScore, // ← חדש בגרסה 6.0
   } = req.body;
   try {
     if (consent) await pool.query('UPDATE students SET consent=$1 WHERE id=$2', [consent.total || false, req.session.user_id]);
     await pool.query(`
-      INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, consent, platform, synced_at,
-                            session_count, avg_session_seconds, push_status, push_sent_at, sync_source, app_version,
+      INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, synced_at, session_count, avg_session_seconds, push_status, push_sent_at, sync_source, app_version,
                             goal_hours, overall_goal_passed, wellness_score)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
       ON CONFLICT (student_id) DO UPDATE SET
-        daily_average=$2, total_minutes=$3, weekly_data=$4, consent=$5, platform=$6, synced_at=$7,
-        session_count=$8, avg_session_seconds=$9, push_status=$10, push_sent_at=$11, sync_source=$12, app_version=$13,
-        goal_hours=$14, overall_goal_passed=$15, wellness_score=$16
+        daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$9, session_count=$10, avg_session_seconds=$11, push_status=$12, push_sent_at=$13, sync_source=$14, app_version=$15,
+        goal_hours=$16, overall_goal_passed=$17, wellness_score=$18
     `, [req.session.user_id, dailyAverage || 0, totalMinutes || 0,
         JSON.stringify(weeklyData || [0,0,0,0,0,0,0]),
+        JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
         JSON.stringify(consent || {}), platform || 'unknown',
         syncedAt || new Date().toISOString(),
         parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
@@ -414,17 +431,15 @@ app.post('/api/report', auth, async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
     const histId = genId();
     await pool.query(`
-      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, consent, platform,
-                                    report_date, synced_at, session_count, avg_session_seconds,
+      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, report_date, synced_at, session_count, avg_session_seconds,
                                     goal_hours, overall_goal_passed, wellness_score)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
-        daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data,
-        consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at,
-        session_count=EXCLUDED.session_count, avg_session_seconds=EXCLUDED.avg_session_seconds,
+        daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data, by_app=EXCLUDED.by_app, timing=EXCLUDED.timing, consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at, session_count=EXCLUDED.session_count, avg_session_seconds=EXCLUDED.avg_session_seconds,
         goal_hours=EXCLUDED.goal_hours, overall_goal_passed=EXCLUDED.overall_goal_passed, wellness_score=EXCLUDED.wellness_score
     `, [histId, req.session.user_id, parseFloat(dailyAverage)||0, parseInt(totalMinutes)||0,
         JSON.stringify(weeklyData||[0,0,0,0,0,0,0]),
+        JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
         JSON.stringify(consent||{}), platform||'unknown',
         today, syncedAt||new Date().toISOString(),
         parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
@@ -445,7 +460,7 @@ app.get('/api/report', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── דירוג כיתתי - מחזיר לתלמיד רק את המיקום שלו עצמו, לא שמות/ציונים של אחרים ───
+// ─── חדש בגרסה 6.0: דירוג כיתתי - מחזיר לתלמיד רק את המיקום שלו עצמו ───
 app.get('/api/class-rank', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   try {
