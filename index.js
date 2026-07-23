@@ -402,26 +402,99 @@ app.get('/api/mood/today', auth, async (req, res) => {
 });
 
 // ─── דוחות ───────────────────────────────────────────────────────────────────
+// ── תגים (גרסה 6.0) ──
+// נבדק אחרי כל דיווח. תג שנפתח נשמר לתמיד ולא נמחק גם אם הרצף נשבר אחר כך.
+async function grantBadge(studentId, badgeType) {
+  await pool.query(
+    `INSERT INTO badges (student_id, badge_type, earned_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (student_id, badge_type) DO NOTHING`,
+    [studentId, badgeType]
+  );
+}
+
+async function evaluateBadges(studentId) {
+  try {
+    const cur = await pool.query(
+      'SELECT current_streak, nighttime_passed, school_hours_passed FROM reports WHERE student_id=$1',
+      [studentId]
+    );
+    if (!cur.rows.length) return;
+    const { current_streak, school_hours_passed } = cur.rows[0];
+
+    // 🎓 תלמיד מצטיין - שבוע לימודים שלם. נספרים רק ימי לימוד (ראשון-חמישי),
+    // כי בשישי-שבת החלון 07:30-13:30 ריק ממילא ולא מעיד על שום דבר.
+    const school = await pool.query(
+      `SELECT report_date FROM reports_history
+       WHERE student_id=$1 AND school_hours_passed = TRUE
+         AND EXTRACT(DOW FROM report_date::date) BETWEEN 0 AND 4
+       ORDER BY report_date::date DESC LIMIT 5`,
+      [studentId]
+    );
+    if (school.rows.length === 5) await grantBadge(studentId, 'star_student');
+
+    // 🔥 רצף אש - אבני דרך
+    if (current_streak >= 7) await grantBadge(studentId, 'streak_fire_7');
+    if (current_streak >= 14) await grantBadge(studentId, 'streak_fire_14');
+    if (current_streak >= 30) await grantBadge(studentId, 'streak_fire_30');
+
+    // 🛡️ שומר הלילה - 5 ימים רצופים של לילה נקי.
+    // נספר רצף אמיתי לפי תאריכים עוקבים, לא רק 5 הרשומות האחרונות.
+    const nights = await pool.query(
+      `SELECT report_date FROM reports_history
+       WHERE student_id=$1 AND nighttime_passed = TRUE
+       ORDER BY report_date::date DESC LIMIT 5`,
+      [studentId]
+    );
+    if (nights.rows.length === 5) {
+      const dates = nights.rows.map(r => new Date(r.report_date));
+      const consecutive = dates.every((d, i) =>
+        i === 0 || Math.round((dates[i-1] - d) / 86400000) === 1
+      );
+      if (consecutive) await grantBadge(studentId, 'night_guardian');
+    }
+  } catch (e) {
+    console.error('[badges] error:', e.message);
+  }
+}
+
+// מחזיר לתלמיד את התגים שצבר
+app.get('/api/badges', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const r = await pool.query(
+      'SELECT badge_type, earned_at FROM badges WHERE student_id=$1 ORDER BY earned_at',
+      [req.session.user_id]
+    );
+    res.json(r.rows.map(b => ({ type: b.badge_type, earnedAt: b.earned_at })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/report', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   const {
     dailyAverage, totalMinutes, weeklyData, consent, platform,
     syncedAt, pushStatus, pushSentAt, syncSource, appVersion,
-    goalHours, overallGoalPassed, wellnessScore, // ← חדש בגרסה 6.0
+    goalHours, overallGoalPassed, wellnessScore,
+    currentStreak, nighttimePassed, schoolHoursPassed, // ← נוספו בהמשך גרסה 6.0
   } = req.body;
   try {
     if (consent) await pool.query('UPDATE students SET consent=$1 WHERE id=$2', [consent.total || false, req.session.user_id]);
     await pool.query(`
       INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, synced_at, session_count, avg_session_seconds, push_status, push_sent_at, sync_source, app_version,
-                            goal_hours, overall_goal_passed, wellness_score)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                            goal_hours, overall_goal_passed, wellness_score,
+                            current_streak, nighttime_passed, school_hours_passed)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
       ON CONFLICT (student_id) DO UPDATE SET
         daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$9, session_count=$10, avg_session_seconds=$11, push_status=$12, push_sent_at=$13, sync_source=$14, app_version=$15,
         -- COALESCE: אם הדיווח הגיע מגרסה ישנה שלא שולחת את השדות האלה,
         -- משאירים את הערך הקיים במקום לדרוס אותו ב-null.
         goal_hours=COALESCE($16, reports.goal_hours),
         overall_goal_passed=COALESCE($17, reports.overall_goal_passed),
-        wellness_score=COALESCE($18, reports.wellness_score)
+        wellness_score=COALESCE($18, reports.wellness_score),
+        current_streak=COALESCE($19, reports.current_streak),
+        nighttime_passed=COALESCE($20, reports.nighttime_passed),
+        school_hours_passed=COALESCE($21, reports.school_hours_passed)
     `, [req.session.user_id, dailyAverage || 0, totalMinutes || 0,
         JSON.stringify(weeklyData || [0,0,0,0,0,0,0]),
         JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
@@ -429,27 +502,35 @@ app.post('/api/report', auth, async (req, res) => {
         syncedAt || new Date().toISOString(),
         parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
         pushStatus || null, pushSentAt || null, syncSource || null, appVersion || null,
-        goalHours || null, overallGoalPassed ?? null, wellnessScore || null]);
+        goalHours || null, overallGoalPassed ?? null, wellnessScore || null,
+        currentStreak ?? null, nighttimePassed ?? null, schoolHoursPassed ?? null]);
 
     // שמירה להיסטוריה יומית
     const today = new Date().toISOString().split('T')[0];
     const histId = genId();
     await pool.query(`
       INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, report_date, synced_at, session_count, avg_session_seconds,
-                                    goal_hours, overall_goal_passed, wellness_score)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                                    goal_hours, overall_goal_passed, wellness_score,
+                                    current_streak, nighttime_passed, school_hours_passed)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
         daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data, by_app=EXCLUDED.by_app, timing=EXCLUDED.timing, consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at, session_count=EXCLUDED.session_count, avg_session_seconds=EXCLUDED.avg_session_seconds,
         goal_hours=COALESCE(EXCLUDED.goal_hours, reports_history.goal_hours),
         overall_goal_passed=COALESCE(EXCLUDED.overall_goal_passed, reports_history.overall_goal_passed),
-        wellness_score=COALESCE(EXCLUDED.wellness_score, reports_history.wellness_score)
+        wellness_score=COALESCE(EXCLUDED.wellness_score, reports_history.wellness_score),
+        current_streak=COALESCE(EXCLUDED.current_streak, reports_history.current_streak),
+        nighttime_passed=COALESCE(EXCLUDED.nighttime_passed, reports_history.nighttime_passed),
+        school_hours_passed=COALESCE(EXCLUDED.school_hours_passed, reports_history.school_hours_passed)
     `, [histId, req.session.user_id, parseFloat(dailyAverage)||0, parseInt(totalMinutes)||0,
         JSON.stringify(weeklyData||[0,0,0,0,0,0,0]),
         JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
         JSON.stringify(consent||{}), platform||'unknown',
         today, syncedAt||new Date().toISOString(),
         parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
-        goalHours || null, overallGoalPassed ?? null, wellnessScore || null]);
+        goalHours || null, overallGoalPassed ?? null, wellnessScore || null,
+        currentStreak ?? null, nighttimePassed ?? null, schoolHoursPassed ?? null]);
+
+    await evaluateBadges(req.session.user_id);
 
     res.json({ ok: true });
   } catch (e) { 
