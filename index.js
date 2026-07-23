@@ -417,7 +417,11 @@ app.post('/api/report', auth, async (req, res) => {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
       ON CONFLICT (student_id) DO UPDATE SET
         daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$9, session_count=$10, avg_session_seconds=$11, push_status=$12, push_sent_at=$13, sync_source=$14, app_version=$15,
-        goal_hours=$16, overall_goal_passed=$17, wellness_score=$18
+        -- COALESCE: אם הדיווח הגיע מגרסה ישנה שלא שולחת את השדות האלה,
+        -- משאירים את הערך הקיים במקום לדרוס אותו ב-null.
+        goal_hours=COALESCE($16, reports.goal_hours),
+        overall_goal_passed=COALESCE($17, reports.overall_goal_passed),
+        wellness_score=COALESCE($18, reports.wellness_score)
     `, [req.session.user_id, dailyAverage || 0, totalMinutes || 0,
         JSON.stringify(weeklyData || [0,0,0,0,0,0,0]),
         JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
@@ -436,7 +440,9 @@ app.post('/api/report', auth, async (req, res) => {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
         daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data, by_app=EXCLUDED.by_app, timing=EXCLUDED.timing, consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at, session_count=EXCLUDED.session_count, avg_session_seconds=EXCLUDED.avg_session_seconds,
-        goal_hours=EXCLUDED.goal_hours, overall_goal_passed=EXCLUDED.overall_goal_passed, wellness_score=EXCLUDED.wellness_score
+        goal_hours=COALESCE(EXCLUDED.goal_hours, reports_history.goal_hours),
+        overall_goal_passed=COALESCE(EXCLUDED.overall_goal_passed, reports_history.overall_goal_passed),
+        wellness_score=COALESCE(EXCLUDED.wellness_score, reports_history.wellness_score)
     `, [histId, req.session.user_id, parseFloat(dailyAverage)||0, parseInt(totalMinutes)||0,
         JSON.stringify(weeklyData||[0,0,0,0,0,0,0]),
         JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
