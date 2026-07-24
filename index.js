@@ -463,7 +463,14 @@ app.get('/api/badges', auth, async (req, res) => {
     res.json(r.rows.map(b => ({ type: b.badge_type, earnedAt: b.earned_at })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+// ניקוי בהתנתקות: מפסיק פוש ומסמן שאין הסכמה פעילה. הנתונים ההיסטוריים נשארים.
+app.post('/api/logout', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    await pool.query('UPDATE students SET fcm_token=NULL, consent=false WHERE id=$1', [req.session.user_id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.post('/api/report', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   const {
