@@ -463,14 +463,7 @@ app.get('/api/badges', auth, async (req, res) => {
     res.json(r.rows.map(b => ({ type: b.badge_type, earnedAt: b.earned_at })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-// ניקוי בהתנתקות: מפסיק פוש ומסמן שאין הסכמה פעילה. הנתונים ההיסטוריים נשארים.
-app.post('/api/logout', auth, async (req, res) => {
-  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
-  try {
-    await pool.query('UPDATE students SET fcm_token=NULL, consent=false WHERE id=$1', [req.session.user_id]);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+
 app.post('/api/report', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   const {
@@ -479,6 +472,11 @@ app.post('/api/report', auth, async (req, res) => {
     goalHours, overallGoalPassed, wellnessScore,
     currentStreak, nighttimePassed, schoolHoursPassed, // ← נוספו בהמשך גרסה 6.0
   } = req.body;
+  // האם הדיווח הגיע מגרסה שיודעת לשלוח את שדות 6.0.
+  // בלי ההבחנה הזו, ערך ריק לגיטימי (למשל יעד 0 = ללא מועדון) היה נחשב כ"לא נשלח"
+  // וה-COALESCE היה משאיר את הערך הישן לנצח.
+  const has = (k) => Object.prototype.hasOwnProperty.call(req.body, k);
+  const isV6 = has('goalHours') || has('wellnessScore') || has('currentStreak');
   try {
     if (consent) await pool.query('UPDATE students SET consent=$1 WHERE id=$2', [consent.total || false, req.session.user_id]);
     await pool.query(`
@@ -488,22 +486,23 @@ app.post('/api/report', auth, async (req, res) => {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
       ON CONFLICT (student_id) DO UPDATE SET
         daily_average=$2, total_minutes=$3, weekly_data=$4, consent=$5, platform=$6, synced_at=$7, session_count=$8, avg_session_seconds=$9, push_status=$10, push_sent_at=$11, sync_source=$12, app_version=$13,
-        -- COALESCE: אם הדיווח הגיע מגרסה ישנה שלא שולחת את השדות האלה,
-        -- משאירים את הערך הקיים במקום לדרוס אותו ב-null.
-        goal_hours=COALESCE($14, reports.goal_hours),
-        overall_goal_passed=COALESCE($15, reports.overall_goal_passed),
-        wellness_score=COALESCE($16, reports.wellness_score),
-        current_streak=COALESCE($17, reports.current_streak),
-        nighttime_passed=COALESCE($18, reports.nighttime_passed),
-        school_hours_passed=COALESCE($19, reports.school_hours_passed)
+        -- אם הדיווח הגיע מגרסה ישנה שלא שולחת את השדות האלה,
+        -- משאירים את הערך הקיים. אחרת כותבים בדיוק את מה שנשלח, כולל 0 או null.
+        goal_hours=CASE WHEN $20 THEN $14 ELSE reports.goal_hours END,
+        overall_goal_passed=CASE WHEN $20 THEN $15 ELSE reports.overall_goal_passed END,
+        wellness_score=CASE WHEN $20 THEN $16 ELSE reports.wellness_score END,
+        current_streak=CASE WHEN $20 THEN $17 ELSE reports.current_streak END,
+        nighttime_passed=CASE WHEN $20 THEN $18 ELSE reports.nighttime_passed END,
+        school_hours_passed=CASE WHEN $20 THEN $19 ELSE reports.school_hours_passed END
     `, [req.session.user_id, dailyAverage || 0, totalMinutes || 0,
         JSON.stringify(weeklyData || [0,0,0,0,0,0,0]),
         JSON.stringify(consent || {}), platform || 'unknown',
         syncedAt || new Date().toISOString(),
         parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
         pushStatus || null, pushSentAt || null, syncSource || null, appVersion || null,
-        goalHours || null, overallGoalPassed ?? null, wellnessScore || null,
-        currentStreak ?? null, nighttimePassed ?? null, schoolHoursPassed ?? null]);
+        goalHours ?? null, overallGoalPassed ?? null, wellnessScore ?? null,
+        currentStreak ?? null, nighttimePassed ?? null, schoolHoursPassed ?? null,
+        isV6]);
 
     // שמירה להיסטוריה יומית
     const today = new Date().toISOString().split('T')[0];
@@ -515,19 +514,20 @@ app.post('/api/report', auth, async (req, res) => {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
         daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data, consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at, session_count=EXCLUDED.session_count, avg_session_seconds=EXCLUDED.avg_session_seconds,
-        goal_hours=COALESCE(EXCLUDED.goal_hours, reports_history.goal_hours),
-        overall_goal_passed=COALESCE(EXCLUDED.overall_goal_passed, reports_history.overall_goal_passed),
-        wellness_score=COALESCE(EXCLUDED.wellness_score, reports_history.wellness_score),
-        current_streak=COALESCE(EXCLUDED.current_streak, reports_history.current_streak),
-        nighttime_passed=COALESCE(EXCLUDED.nighttime_passed, reports_history.nighttime_passed),
-        school_hours_passed=COALESCE(EXCLUDED.school_hours_passed, reports_history.school_hours_passed)
+        goal_hours=CASE WHEN $18 THEN EXCLUDED.goal_hours ELSE reports_history.goal_hours END,
+        overall_goal_passed=CASE WHEN $18 THEN EXCLUDED.overall_goal_passed ELSE reports_history.overall_goal_passed END,
+        wellness_score=CASE WHEN $18 THEN EXCLUDED.wellness_score ELSE reports_history.wellness_score END,
+        current_streak=CASE WHEN $18 THEN EXCLUDED.current_streak ELSE reports_history.current_streak END,
+        nighttime_passed=CASE WHEN $18 THEN EXCLUDED.nighttime_passed ELSE reports_history.nighttime_passed END,
+        school_hours_passed=CASE WHEN $18 THEN EXCLUDED.school_hours_passed ELSE reports_history.school_hours_passed END
     `, [histId, req.session.user_id, parseFloat(dailyAverage)||0, parseInt(totalMinutes)||0,
         JSON.stringify(weeklyData||[0,0,0,0,0,0,0]),
         JSON.stringify(consent||{}), platform||'unknown',
         today, syncedAt||new Date().toISOString(),
         parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
-        goalHours || null, overallGoalPassed ?? null, wellnessScore || null,
-        currentStreak ?? null, nighttimePassed ?? null, schoolHoursPassed ?? null]);
+        goalHours ?? null, overallGoalPassed ?? null, wellnessScore ?? null,
+        currentStreak ?? null, nighttimePassed ?? null, schoolHoursPassed ?? null,
+        isV6]);
 
     await evaluateBadges(req.session.user_id);
 
