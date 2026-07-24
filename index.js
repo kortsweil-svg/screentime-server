@@ -62,14 +62,10 @@ async function initDB() {
       daily_average NUMERIC DEFAULT 0,
       total_minutes INTEGER DEFAULT 0,
       weekly_data JSONB DEFAULT '[0,0,0,0,0,0,0]',
-      by_app JSONB DEFAULT '{}',
-      timing JSONB DEFAULT '{}',
       consent JSONB DEFAULT '{}',
       platform TEXT,
       synced_at TIMESTAMP DEFAULT NOW()
     );
-    ALTER TABLE reports ADD COLUMN IF NOT EXISTS by_app JSONB DEFAULT '{}';
-    ALTER TABLE reports ADD COLUMN IF NOT EXISTS timing JSONB DEFAULT '{}';
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS push_status TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS push_sent_at TIMESTAMP;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS sync_source TEXT;
@@ -238,7 +234,7 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     const r = await pool.query(`
-      SELECT s.*, r.daily_average, r.weekly_data, r.by_app, r.timing, r.synced_at, r.session_count, r.avg_session_seconds, r.push_status, r.push_sent_at, r.sync_source,
+      SELECT s.*, r.daily_average, r.weekly_data, r.synced_at, r.session_count, r.avg_session_seconds, r.push_status, r.push_sent_at, r.sync_source,
              r.goal_hours, r.overall_goal_passed, r.wellness_score, m.mood
       FROM students s
       LEFT JOIN reports r ON s.id = r.student_id
@@ -253,8 +249,6 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
       platform: 'android', consent: s.consent, active: s.active,
       hours: parseFloat(s.daily_average) || 0,
       weeklyData: s.weekly_data || [0,0,0,0,0,0,0],
-      byApp: s.by_app || {},
-      timing: s.timing || {},
       lastSync: s.synced_at || null,
       mood: s.mood || null,
       sessionCount: s.session_count || 0,
@@ -341,7 +335,7 @@ app.get('/api/history', auth, teacherOnly, async (req, res) => {
     else fromDate = '2020-01-01'; // מאז תמיד
 
     const r = await pool.query(`
-      SELECT s.id, s.name, s.class_name, h.daily_average, h.weekly_data, h.by_app, h.timing, h.report_date, h.synced_at,
+      SELECT s.id, s.name, s.class_name, h.daily_average, h.weekly_data, h.report_date, h.synced_at,
              h.goal_hours, h.overall_goal_passed, h.wellness_score
       FROM students s
       LEFT JOIN reports_history h ON s.id = h.student_id AND h.report_date >= $2
@@ -481,23 +475,22 @@ app.post('/api/report', auth, async (req, res) => {
   try {
     if (consent) await pool.query('UPDATE students SET consent=$1 WHERE id=$2', [consent.total || false, req.session.user_id]);
     await pool.query(`
-      INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, synced_at, session_count, avg_session_seconds, push_status, push_sent_at, sync_source, app_version,
+      INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, consent, platform, synced_at, session_count, avg_session_seconds, push_status, push_sent_at, sync_source, app_version,
                             goal_hours, overall_goal_passed, wellness_score,
                             current_streak, nighttime_passed, school_hours_passed)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
       ON CONFLICT (student_id) DO UPDATE SET
-        daily_average=$2, total_minutes=$3, weekly_data=$4, by_app=$5, timing=$6, consent=$7, platform=$8, synced_at=$9, session_count=$10, avg_session_seconds=$11, push_status=$12, push_sent_at=$13, sync_source=$14, app_version=$15,
+        daily_average=$2, total_minutes=$3, weekly_data=$4, consent=$5, platform=$6, synced_at=$7, session_count=$8, avg_session_seconds=$9, push_status=$10, push_sent_at=$11, sync_source=$12, app_version=$13,
         -- COALESCE: אם הדיווח הגיע מגרסה ישנה שלא שולחת את השדות האלה,
         -- משאירים את הערך הקיים במקום לדרוס אותו ב-null.
-        goal_hours=COALESCE($16, reports.goal_hours),
-        overall_goal_passed=COALESCE($17, reports.overall_goal_passed),
-        wellness_score=COALESCE($18, reports.wellness_score),
-        current_streak=COALESCE($19, reports.current_streak),
-        nighttime_passed=COALESCE($20, reports.nighttime_passed),
-        school_hours_passed=COALESCE($21, reports.school_hours_passed)
+        goal_hours=COALESCE($14, reports.goal_hours),
+        overall_goal_passed=COALESCE($15, reports.overall_goal_passed),
+        wellness_score=COALESCE($16, reports.wellness_score),
+        current_streak=COALESCE($17, reports.current_streak),
+        nighttime_passed=COALESCE($18, reports.nighttime_passed),
+        school_hours_passed=COALESCE($19, reports.school_hours_passed)
     `, [req.session.user_id, dailyAverage || 0, totalMinutes || 0,
         JSON.stringify(weeklyData || [0,0,0,0,0,0,0]),
-        JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
         JSON.stringify(consent || {}), platform || 'unknown',
         syncedAt || new Date().toISOString(),
         parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
@@ -509,12 +502,12 @@ app.post('/api/report', auth, async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
     const histId = genId();
     await pool.query(`
-      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, by_app, timing, consent, platform, report_date, synced_at, session_count, avg_session_seconds,
+      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, consent, platform, report_date, synced_at, session_count, avg_session_seconds,
                                     goal_hours, overall_goal_passed, wellness_score,
                                     current_streak, nighttime_passed, school_hours_passed)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
-        daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data, by_app=EXCLUDED.by_app, timing=EXCLUDED.timing, consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at, session_count=EXCLUDED.session_count, avg_session_seconds=EXCLUDED.avg_session_seconds,
+        daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data, consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at, session_count=EXCLUDED.session_count, avg_session_seconds=EXCLUDED.avg_session_seconds,
         goal_hours=COALESCE(EXCLUDED.goal_hours, reports_history.goal_hours),
         overall_goal_passed=COALESCE(EXCLUDED.overall_goal_passed, reports_history.overall_goal_passed),
         wellness_score=COALESCE(EXCLUDED.wellness_score, reports_history.wellness_score),
@@ -523,7 +516,6 @@ app.post('/api/report', auth, async (req, res) => {
         school_hours_passed=COALESCE(EXCLUDED.school_hours_passed, reports_history.school_hours_passed)
     `, [histId, req.session.user_id, parseFloat(dailyAverage)||0, parseInt(totalMinutes)||0,
         JSON.stringify(weeklyData||[0,0,0,0,0,0,0]),
-        JSON.stringify(req.body.byApp || {}), JSON.stringify(req.body.timing || {}),
         JSON.stringify(consent||{}), platform||'unknown',
         today, syncedAt||new Date().toISOString(),
         parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
