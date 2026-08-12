@@ -416,16 +416,22 @@ async function evaluateBadges(studentId) {
     if (!cur.rows.length) return;
     const { current_streak, school_hours_passed } = cur.rows[0];
 
-    // 🎓 תלמיד מצטיין - שבוע לימודים שלם. נספרים רק ימי לימוד (ראשון-חמישי),
-    // כי בשישי-שבת החלון 07:30-13:30 ריק ממילא ולא מעיד על שום דבר.
-    const school = await pool.query(
-      `SELECT report_date FROM reports_history
-       WHERE student_id=$1 AND school_hours_passed = TRUE
+    // 🎓 תלמיד מצטיין - 5 ימי לימוד *רצופים* עם ניתוק בשעות הלימודים.
+    // נספרים רק ראשון-חמישי (שישי ושבת מדולגים, החלון ריק בהם ממילא),
+    // והספירה נעצרת ביום הלימוד הראשון שלא עמד. מיושר ללוגיקה המקומית באפליקציה.
+    const schoolRows = await pool.query(
+      `SELECT school_hours_passed FROM reports_history
+       WHERE student_id=$1
          AND EXTRACT(DOW FROM report_date::date) BETWEEN 0 AND 4
-       ORDER BY report_date::date DESC LIMIT 5`,
+       ORDER BY report_date::date DESC LIMIT 30`,
       [studentId]
     );
-    if (school.rows.length === 5) await grantBadge(studentId, 'star_student');
+    let schoolRun = 0;
+    for (const r of schoolRows.rows) {
+      if (r.school_hours_passed === true) schoolRun++;
+      else break;
+    }
+    if (schoolRun >= 5) await grantBadge(studentId, 'star_student');
 
     // 🔥 רצף אש - אבני דרך
     if (current_streak >= 7) await grantBadge(studentId, 'streak_fire_7');
