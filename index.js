@@ -651,11 +651,9 @@ async function sendSilentPushToAll(period) {
         },
       });
       sent++;
-    } catch (e) {
+        } catch (e) {
       failed++;
-       console.log(`[FCM] failed ${student.id}: ${e.code || ''} ${e.message || ''}`);
-      // אם הטוקן לא תקף יותר (המשתמש הסיר את האפליקציה) - נסמן למחיקה
-      if (e.code === 'messaging/registration-token-not-registered' ||
+      console.log(`[FCM] failed ${student.id}: ${e.code || ''} ${e.message || ''}`);
       // אם הטוקן לא תקף יותר (המשתמש הסיר את האפליקציה) - נסמן למחיקה
       if (e.code === 'messaging/registration-token-not-registered' ||
           e.code === 'messaging/invalid-registration-token') {
@@ -663,7 +661,6 @@ async function sendSilentPushToAll(period) {
       }
     }
   }
-
   // ניקוי טוקנים לא תקפים
   if (invalidTokens.length) {
     await pool.query('UPDATE students SET fcm_token=NULL WHERE id = ANY($1)', [invalidTokens]);
