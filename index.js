@@ -636,6 +636,19 @@ async function sendSilentPushToAll(period) {
           ttl: 30 * 60 * 1000, // תוקף חצי שעה (במילישניות): אם המכשיר לא זמין תוך 30 דקות,
                                // ההודעה מתבטלת ולא נמסרת מאוחר (למשל פוש שבת שיגיע במוצ"ש).
         },
+        apns: {
+          // ב-iOS פוש שקט מחייב content-available ועדיפות 5, אחרת
+          // המערכת לא מעירה את האפליקציה כלל. גם עם זה iOS מחליט
+          // בעצמו אם להריץ, לפי סוללה ודפוסי שימוש - זה best effort.
+          headers: {
+            'apns-priority': '5',
+            'apns-push-type': 'background',
+            'apns-expiration': String(Math.floor(Date.now() / 1000) + 30 * 60),
+          },
+          payload: {
+            aps: { 'content-available': 1 },
+          },
+        },
       });
       sent++;
     } catch (e) {
