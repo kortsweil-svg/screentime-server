@@ -356,12 +356,16 @@ app.get('/api/class-average', auth, async (req, res) => {
     const { class_name, teacher_id } = student.rows[0];
 
     // חשב ממוצע של כל התלמידים בכיתה
+        // הממוצע מחושב על שאר הכיתה בלבד, בלי התלמיד ששואל -
+    // אחרת הוא משווה את עצמו לממוצע שהוא עצמו חלק ממנו,
+    // וכל עלייה אצלו מושכת גם את קו ההשוואה למעלה.
     const r = await pool.query(`
       SELECT AVG(r.daily_average) as class_avg, COUNT(s.id) as student_count
       FROM students s
-      LEFT JOIN reports r ON s.id = r.student_id
-      WHERE s.teacher_id = $1 AND s.class_name = $2 AND r.daily_average > 0
-    `, [teacher_id, class_name]);
+      JOIN reports r ON s.id = r.student_id
+      WHERE s.teacher_id = $1 AND s.class_name = $2
+        AND s.id <> $3 AND r.daily_average > 0
+    `, [teacher_id, class_name, req.session.user_id]);
 
     const classAvg = parseFloat(r.rows[0]?.class_avg) || 0;
     const studentCount = parseInt(r.rows[0]?.student_count) || 0;
