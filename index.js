@@ -70,6 +70,10 @@ async function initDB() {
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS push_sent_at TIMESTAMP;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS sync_source TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS app_version TEXT;
+    -- דקות השימוש של אותו יום בלבד. total_minutes הוא שעות מצטברות
+    -- ו-daily_average הוא ממוצע שבועי, אז אף אחד מהם לא מתאים לשחזור
+    -- ההיסטוריה היומית אחרי התקנה מחדש.
+    ALTER TABLE reports_history ADD COLUMN IF NOT EXISTS day_minutes INTEGER;
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -355,8 +359,7 @@ app.get('/api/class-average', auth, async (req, res) => {
     if (!student.rows.length) return res.status(404).json({ error: 'תלמיד לא נמצא' });
     const { class_name, teacher_id } = student.rows[0];
 
-    // חשב ממוצע של כל התלמידים בכיתה
-        // הממוצע מחושב על שאר הכיתה בלבד, בלי התלמיד ששואל -
+    // הממוצע מחושב על שאר הכיתה בלבד, בלי התלמיד ששואל -
     // אחרת הוא משווה את עצמו לממוצע שהוא עצמו חלק ממנו,
     // וכל עלייה אצלו מושכת גם את קו ההשוואה למעלה.
     const r = await pool.query(`
@@ -481,6 +484,7 @@ app.post('/api/report', auth, async (req, res) => {
     syncedAt, pushStatus, pushSentAt, syncSource, appVersion,
     goalHours, overallGoalPassed, wellnessScore,
     currentStreak, nighttimePassed, schoolHoursPassed, // ← נוספו בהמשך גרסה 6.0
+    dayMinutes, // ← דקות השימוש של היום הזה בלבד, לשחזור היסטוריה
   } = req.body;
   // האם הדיווח הגיע מגרסה שיודעת לשלוח את שדות 6.0.
   // בלי ההבחנה הזו, ערך ריק לגיטימי (למשל יעד 0 = ללא מועדון) היה נחשב כ"לא נשלח"
@@ -520,8 +524,8 @@ app.post('/api/report', auth, async (req, res) => {
     await pool.query(`
       INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, consent, platform, report_date, synced_at, session_count, avg_session_seconds,
                                     goal_hours, overall_goal_passed, wellness_score,
-                                    current_streak, nighttime_passed, school_hours_passed)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                                    current_streak, nighttime_passed, school_hours_passed, day_minutes)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$19)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
         daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data, consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at, session_count=EXCLUDED.session_count, avg_session_seconds=EXCLUDED.avg_session_seconds,
         goal_hours=CASE WHEN $18 THEN EXCLUDED.goal_hours ELSE reports_history.goal_hours END,
@@ -529,7 +533,10 @@ app.post('/api/report', auth, async (req, res) => {
         wellness_score=CASE WHEN $18 THEN EXCLUDED.wellness_score ELSE reports_history.wellness_score END,
         current_streak=CASE WHEN $18 THEN EXCLUDED.current_streak ELSE reports_history.current_streak END,
         nighttime_passed=CASE WHEN $18 THEN EXCLUDED.nighttime_passed ELSE reports_history.nighttime_passed END,
-        school_hours_passed=CASE WHEN $18 THEN EXCLUDED.school_hours_passed ELSE reports_history.school_hours_passed END
+        school_hours_passed=CASE WHEN $18 THEN EXCLUDED.school_hours_passed ELSE reports_history.school_hours_passed END,
+        -- נשמר רק כשנשלח ערך. גרסה ישנה או דיווח בלי נתון לא ידרסו
+        -- את מה שכבר נשמר היום.
+        day_minutes=CASE WHEN EXCLUDED.day_minutes IS NOT NULL THEN EXCLUDED.day_minutes ELSE reports_history.day_minutes END
     `, [histId, req.session.user_id, parseFloat(dailyAverage)||0, parseInt(totalMinutes)||0,
         JSON.stringify(weeklyData||[0,0,0,0,0,0,0]),
         JSON.stringify(consent||{}), platform||'unknown',
@@ -537,7 +544,7 @@ app.post('/api/report', auth, async (req, res) => {
         parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
         goalHours ?? null, overallGoalPassed ?? null, wellnessScore ?? null,
         currentStreak ?? null, nighttimePassed ?? null, schoolHoursPassed ?? null,
-        isV6]);
+        isV6, dayMinutes ?? null]);
 
     await evaluateBadges(req.session.user_id);
 
@@ -553,6 +560,31 @@ app.get('/api/report', auth, async (req, res) => {
   try {
     const r = await pool.query('SELECT * FROM reports WHERE student_id=$1', [req.session.user_id]);
     res.json(r.rows[0] || {});
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── שחזור היסטוריה לתלמיד אחרי התקנה מחדש ───────────────────────────────────
+// מחזיר את הדקות היומיות ששמורות בשרת, כדי שהאפליקציה תמזג אותן
+// להיסטוריה המקומית. באנדרואיד המכשיר עצמו הוא מקור אמין יותר לימים
+// האחרונים, אז שם המיזוג צריך להיות משלים בלבד ולא דורס.
+app.get('/api/my-history', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const r = await pool.query(`
+      SELECT report_date, day_minutes, synced_at
+      FROM reports_history
+      WHERE student_id = $1 AND day_minutes IS NOT NULL
+      ORDER BY report_date DESC LIMIT 60
+    `, [req.session.user_id]);
+    res.json({
+      days: r.rows.map(x => ({
+        date: typeof x.report_date === 'string'
+          ? x.report_date
+          : new Date(x.report_date).toISOString().split('T')[0],
+        minutes: x.day_minutes,
+      })),
+      lastSync: r.rows[0]?.synced_at || null,
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
