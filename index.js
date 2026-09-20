@@ -362,12 +362,15 @@ app.get('/api/class-average', auth, async (req, res) => {
     // הממוצע מחושב על שאר הכיתה בלבד, בלי התלמיד ששואל -
     // אחרת הוא משווה את עצמו לממוצע שהוא עצמו חלק ממנו,
     // וכל עלייה אצלו מושכת גם את קו ההשוואה למעלה.
+    // רק דיווחים מהשבוע האחרון. בלי הסינון, תלמיד שלא פתח את
+    // האפליקציה חודשים מזהם את הממוצע בנתון ישן.
     const r = await pool.query(`
       SELECT AVG(r.daily_average) as class_avg, COUNT(s.id) as student_count
       FROM students s
       JOIN reports r ON s.id = r.student_id
       WHERE s.teacher_id = $1 AND s.class_name = $2
         AND s.id <> $3 AND r.daily_average > 0
+        AND r.synced_at > NOW() - INTERVAL '7 days'
     `, [teacher_id, class_name, req.session.user_id]);
 
     const classAvg = parseFloat(r.rows[0]?.class_avg) || 0;
@@ -593,12 +596,33 @@ app.get('/api/class-rank', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   try {
     const r = await pool.query(
-      'SELECT class_rank, class_size, avg_score FROM class_rank_current_week WHERE student_id=$1',
+      'SELECT class_rank, class_size, avg_score, class_name FROM class_rank_current_week WHERE student_id=$1',
       [req.session.user_id]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'אין עדיין דירוג לשבוע הנוכחי' });
     const row = r.rows[0];
-    res.json({ rank: row.class_rank, classSize: row.class_size, avgScore: row.avg_score });
+
+    // כמה תלמידים חולקים את אותו ציון. כשכולם שווים הדירוג חסר
+    // משמעות - כל אחד "במקום הראשון" - והאפליקציה מסתירה את הכרטיס.
+    const tie = await pool.query(
+      `SELECT COUNT(*)::int AS n, COUNT(DISTINCT avg_score)::int AS distinct_scores
+       FROM class_rank_current_week
+       WHERE class_name = $1 AND avg_score = $2`,
+      [row.class_name, row.avg_score]
+    );
+    const all = await pool.query(
+      `SELECT COUNT(DISTINCT avg_score)::int AS distinct_scores
+       FROM class_rank_current_week WHERE class_name = $1`,
+      [row.class_name]
+    );
+
+    res.json({
+      rank: row.class_rank,
+      classSize: row.class_size,
+      avgScore: row.avg_score,
+      sharedWith: (tie.rows[0]?.n || 1) - 1,
+      distinctScores: all.rows[0]?.distinct_scores || 1,
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -651,9 +675,8 @@ async function sendSilentPushToAll(period) {
         },
       });
       sent++;
-        } catch (e) {
+    } catch (e) {
       failed++;
-      console.log(`[FCM] failed ${student.id}: ${e.code || ''} ${e.message || ''}`);
       // אם הטוקן לא תקף יותר (המשתמש הסיר את האפליקציה) - נסמן למחיקה
       if (e.code === 'messaging/registration-token-not-registered' ||
           e.code === 'messaging/invalid-registration-token') {
@@ -661,6 +684,7 @@ async function sendSilentPushToAll(period) {
       }
     }
   }
+
   // ניקוי טוקנים לא תקפים
   if (invalidTokens.length) {
     await pool.query('UPDATE students SET fcm_token=NULL WHERE id = ANY($1)', [invalidTokens]);
