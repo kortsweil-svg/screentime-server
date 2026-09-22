@@ -364,13 +364,31 @@ app.get('/api/class-average', auth, async (req, res) => {
     // וכל עלייה אצלו מושכת גם את קו ההשוואה למעלה.
     // רק דיווחים מהשבוע האחרון. בלי הסינון, תלמיד שלא פתח את
     // האפליקציה חודשים מזהם את הממוצע בנתון ישן.
+    // ממוצע של 7 הימים הסגורים האחרונים לכל תלמיד, מתוך ההיסטוריה היומית.
+    // ב-iOS השדה daily_average מכיל את היום בלבד, ובאנדרואיד ממוצע שבועי -
+    // השוואה ישירה ביניהם מערבבת יום אחד עם שבוע. לכן: היסטוריה כשיש
+    // (iOS שולח day_minutes), ו-daily_average רק כגיבוי (אנדרואיד).
     const r = await pool.query(`
-      SELECT AVG(r.daily_average) as class_avg, COUNT(s.id) as student_count
-      FROM students s
-      JOIN reports r ON s.id = r.student_id
-      WHERE s.teacher_id = $1 AND s.class_name = $2
-        AND s.id <> $3 AND r.daily_average > 0
-        AND r.synced_at > NOW() - INTERVAL '7 days'
+      WITH per AS (
+        SELECT s.id,
+          COALESCE(
+            (SELECT AVG(d.dm) FROM (
+               SELECT MAX(h.day_minutes) AS dm
+               FROM reports_history h
+               WHERE h.student_id = s.id AND h.day_minutes > 0
+                 AND h.report_date::date BETWEEN CURRENT_DATE - 7 AND CURRENT_DATE - 1
+               GROUP BY h.report_date
+             ) d),
+            r.daily_average * 60
+          ) AS mins
+        FROM students s
+        JOIN reports r ON s.id = r.student_id
+        WHERE s.teacher_id = $1 AND s.class_name = $2
+          AND s.id <> $3
+          AND r.synced_at > NOW() - INTERVAL '7 days'
+      )
+      SELECT AVG(mins) / 60.0 AS class_avg, COUNT(*) AS student_count
+      FROM per WHERE mins > 0
     `, [teacher_id, class_name, req.session.user_id]);
 
     const classAvg = parseFloat(r.rows[0]?.class_avg) || 0;
