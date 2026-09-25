@@ -90,6 +90,50 @@ async function initDB() {
       UNIQUE(student_id, date)
     );
   `);
+
+  // דירוג שבועי לפי מספר הימים שהתלמיד עמד ביעד, מיום א' עד אתמול (שעון ישראל).
+  // התלמידים מקובצים לפי מורה ויעד, כך שמשווים רק בין מי שבחרו אותו יעד.
+  // קבוצה של פחות מ-3 תלמידים לא מדורגת. כשל ביצירת ה-VIEW לא מפיל את השרת.
+  try {
+    await pool.query(`
+      CREATE OR REPLACE VIEW goal_rank_current_week AS
+      WITH bounds AS (
+        SELECT (NOW() AT TIME ZONE 'Asia/Jerusalem')::date AS today,
+               (NOW() AT TIME ZONE 'Asia/Jerusalem')::date
+                 - EXTRACT(DOW FROM (NOW() AT TIME ZONE 'Asia/Jerusalem'))::int AS week_start
+      ),
+      members AS (
+        SELECT s.id AS student_id, s.teacher_id, r.goal_hours::numeric AS goal_hours
+        FROM students s
+        JOIN reports r ON r.student_id = s.id
+        WHERE s.active = TRUE AND s.consent = TRUE AND r.goal_hours::numeric > 0
+      ),
+      met AS (
+        SELECT m.student_id, m.teacher_id, m.goal_hours,
+               COUNT(h.student_id) FILTER (
+                 WHERE h.day_minutes IS NOT NULL AND h.day_minutes <= m.goal_hours * 60
+               )::int AS days_met,
+               COUNT(h.student_id) FILTER (WHERE h.day_minutes IS NOT NULL)::int AS days_reported
+        FROM members m
+        CROSS JOIN bounds b
+        LEFT JOIN reports_history h
+          ON h.student_id = m.student_id
+         AND h.report_date::date >= b.week_start
+         AND h.report_date::date < b.today
+        GROUP BY m.student_id, m.teacher_id, m.goal_hours
+      ),
+      ranked AS (
+        SELECT met.*,
+               RANK() OVER (PARTITION BY teacher_id, goal_hours ORDER BY days_met DESC)::int AS goal_rank,
+               COUNT(*) OVER (PARTITION BY teacher_id, goal_hours)::int AS group_size
+        FROM met
+      )
+      SELECT * FROM ranked WHERE group_size >= 3;
+    `);
+    console.log('goal_rank_current_week ready');
+  } catch (e) {
+    console.log('[goal_rank view] error:', e.message);
+  }
   console.log('DB ready');
 }
 
@@ -540,7 +584,8 @@ app.post('/api/report', auth, async (req, res) => {
         isV6]);
 
     // שמירה להיסטוריה יומית
-    const today = new Date().toISOString().split('T')[0];
+    // תאריך לפי שעון ישראל. לפי UTC, דיווח בין חצות ל-03:00 נרשם ליום הקודם.
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
     const histId = genId();
     await pool.query(`
       INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, consent, platform, report_date, synced_at, session_count, avg_session_seconds,
@@ -644,6 +689,33 @@ app.get('/api/class-rank', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── דירוג שבועי לפי ימים שעמד ביעד, בתוך קבוצת אותו יעד ───
+// מחזיר לתלמיד רק את המיקום שלו. 404 כשאין דירוג: אין יעד, אין הסכמה, או קבוצה קטנה מ-3.
+app.get('/api/goal-rank', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const r = await pool.query(
+      'SELECT goal_rank, group_size, days_met, days_reported, goal_hours, teacher_id FROM goal_rank_current_week WHERE student_id=$1',
+      [req.session.user_id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'אין דירוג לשבוע הנוכחי' });
+    const row = r.rows[0];
+    const tie = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM goal_rank_current_week
+       WHERE teacher_id = $1 AND goal_hours = $2 AND days_met = $3`,
+      [row.teacher_id, row.goal_hours, row.days_met]
+    );
+    res.json({
+      rank: row.goal_rank,
+      groupSize: row.group_size,
+      daysMet: row.days_met,
+      daysReported: row.days_reported,
+      goalHours: Number(row.goal_hours),
+      sharedWith: (tie.rows[0]?.n || 1) - 1,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── שמירת טוקן FCM של תלמיד ──
 app.post('/api/update-fcm-token', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
@@ -657,14 +729,23 @@ app.post('/api/update-fcm-token', auth, async (req, res) => {
 
 // ── שליחת הודעת FCM שקטה (data message) לכל התלמידים ──
 // ההודעה מעירה את האפליקציה על המכשיר, והיא קוראת זמן מסך טרי ומציגה פוש מקומי.
-// מופעל על ידי שירות תזמון חיצוני (cron-job.org) ב-12:00 וב-20:00.
+// מופעל על ידי שירות תזמון חיצוני (cron-job.org).
+// iOS: 07:00 (period=morning) ו-17:00 (period=afternoon), עם platform=ios.
+// אנדרואיד: 12:00 ו-20:00, עם platform=android.
+// בלי platform - נשלח לכולם (התנהגות קודמת).
 // מוגן בסוד פשוט (CRON_SECRET) כדי שלא כל אחד יוכל להפעיל.
-async function sendSilentPushToAll(period) {
+async function sendSilentPushToAll(period, platform) {
   if (!firebaseReady) {
     console.log('[FCM] skipped - firebase not ready');
     return { sent: 0, failed: 0, error: 'firebase not ready' };
   }
-  const r = await pool.query("SELECT id, fcm_token FROM students WHERE fcm_token IS NOT NULL AND active=TRUE");
+  const r = platform
+    ? await pool.query(
+        `SELECT s.id, s.fcm_token FROM students s
+         JOIN reports rp ON rp.student_id = s.id
+         WHERE s.fcm_token IS NOT NULL AND s.active=TRUE AND rp.platform = $1`,
+        [platform])
+    : await pool.query("SELECT id, fcm_token FROM students WHERE fcm_token IS NOT NULL AND active=TRUE");
   let sent = 0, failed = 0;
   const invalidTokens = [];
 
@@ -708,7 +789,7 @@ async function sendSilentPushToAll(period) {
     await pool.query('UPDATE students SET fcm_token=NULL WHERE id = ANY($1)', [invalidTokens]);
   }
 
-  console.log(`[FCM] period=${period} sent=${sent} failed=${failed} cleaned=${invalidTokens.length}`);
+  console.log(`[FCM] period=${period} platform=${platform || 'all'} sent=${sent} failed=${failed} cleaned=${invalidTokens.length}`);
   return { sent, failed, cleaned: invalidTokens.length };
 }
 
@@ -721,8 +802,12 @@ app.all('/api/send-daily-push', async (req, res) => {
     return res.status(403).json({ error: 'forbidden' });
   }
   const period = req.query.period || req.body?.period || 'noon';
+  const platform = req.query.platform || req.body?.platform || null;
+  if (platform && !['ios', 'android'].includes(platform)) {
+    return res.status(400).json({ error: 'platform must be ios or android' });
+  }
   try {
-    const result = await sendSilentPushToAll(period);
+    const result = await sendSilentPushToAll(period, platform);
     res.json({ ok: true, ...result });
   } catch (e) {
     console.log('[send-daily-push] error:', e.message);
