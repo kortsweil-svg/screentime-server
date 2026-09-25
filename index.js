@@ -130,7 +130,8 @@ async function initDB() {
       ),
       ranked AS (
         SELECT met.*,
-               RANK() OVER (PARTITION BY teacher_id, goal_hours ORDER BY days_met DESC)::int AS goal_rank,
+               -- דירוג בלי דילוג אחרי תיקו: 1, 2, 2, 2, 3 (ולא 1, 2, 2, 2, 5).
+               DENSE_RANK() OVER (PARTITION BY teacher_id, goal_hours ORDER BY days_met DESC)::int AS goal_rank,
                COUNT(*) OVER (PARTITION BY teacher_id, goal_hours)::int AS group_size
         FROM met
       )
