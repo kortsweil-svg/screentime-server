@@ -747,16 +747,27 @@ async function sendSilentPushToAll(period, platform) {
   }
   const r = platform
     ? await pool.query(
-        `SELECT s.id, s.fcm_token FROM students s
+        `SELECT s.id, s.name, s.fcm_token, rp.goal_hours FROM students s
          JOIN reports rp ON rp.student_id = s.id
          WHERE s.fcm_token IS NOT NULL AND s.active=TRUE AND rp.platform = $1`,
         [platform])
-    : await pool.query("SELECT id, fcm_token FROM students WHERE fcm_token IS NOT NULL AND active=TRUE");
+    : await pool.query(
+        `SELECT s.id, s.name, s.fcm_token, rp.goal_hours FROM students s
+         LEFT JOIN reports rp ON rp.student_id = s.id
+         WHERE s.fcm_token IS NOT NULL AND s.active=TRUE`);
   let sent = 0, failed = 0;
   const invalidTokens = [];
+  const failures = [];
 
   for (const student of r.rows) {
     try {
+      // פוש הבוקר הוא התראה רגילה ולא שקטה: כל מה שהוא צריך זה היעד,
+      // והיעד שמור בשרת. התראה רגילה מגיעה תמיד, גם כשהאפליקציה נסגרה בהחלקה.
+      if (period === 'morning') {
+        await admin.messaging().send(buildMorningAlert(student));
+        sent++;
+        continue;
+      }
       await admin.messaging().send({
         token: student.fcm_token,
         data: { type: 'daily_sync', period: period || 'noon' },
@@ -782,6 +793,8 @@ async function sendSilentPushToAll(period, platform) {
       sent++;
     } catch (e) {
       failed++;
+      failures.push({ id: student.id, name: student.name, code: e.code || 'unknown', message: (e.message || '').slice(0, 120) });
+      console.log(`[FCM] failed student=${student.id} code=${e.code} msg=${e.message}`);
       // אם הטוקן לא תקף יותר (המשתמש הסיר את האפליקציה) - נסמן למחיקה
       if (e.code === 'messaging/registration-token-not-registered' ||
           e.code === 'messaging/invalid-registration-token') {
@@ -796,7 +809,43 @@ async function sendSilentPushToAll(period, platform) {
   }
 
   console.log(`[FCM] period=${period} platform=${platform || 'all'} sent=${sent} failed=${failed} cleaned=${invalidTokens.length}`);
-  return { sent, failed, cleaned: invalidTokens.length };
+  return { sent, failed, cleaned: invalidTokens.length, failures };
+}
+
+const MORNING_CHEERS = [
+  'אתה יכול לעשות את זה 💪',
+  'יום חדש, הזדמנות חדשה 🌱',
+  'בהצלחה היום! 🎯',
+  'עוד יום אחד לכיוון הכוכב ⭐',
+];
+
+function fmtHours(h) {
+  const n = Number(h) || 0;
+  return n === 1 ? 'שעה' : n === 2 ? 'שעתיים' : `${n} שעות`;
+}
+
+function buildMorningAlert(student) {
+  const cheer = MORNING_CHEERS[Math.floor(Math.random() * MORNING_CHEERS.length)];
+  const goal = Number(student.goal_hours) || 0;
+  const body = goal > 0
+    ? `היעד שלך היום: ${fmtHours(goal)}. ${cheer}`
+    : 'בחר יעד יומי באפליקציה ותתחיל לצבור כוכבים 🎯';
+  return {
+    token: student.fcm_token,
+    notification: { title: 'בוקר טוב ☀️', body },
+    // type שונה מ-daily_sync, כדי שהאפליקציה לא תריץ עליו סנכרון.
+    data: { type: 'morning_alert' },
+    android: { priority: 'high', ttl: 2 * 60 * 60 * 1000 },
+    apns: {
+      headers: {
+        'apns-priority': '10',
+        'apns-push-type': 'alert',
+        // תוקף שעתיים: פוש בוקר שמגיע בצהריים כבר לא רלוונטי.
+        'apns-expiration': String(Math.floor(Date.now() / 1000) + 2 * 60 * 60),
+      },
+      payload: { aps: { sound: 'default' } },
+    },
+  };
 }
 
 // app.all - הנתיב מקבל גם GET וגם POST (וכל שיטה). כך ה-cron עובד בכל הגדרה,
