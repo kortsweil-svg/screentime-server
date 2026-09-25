@@ -618,6 +618,33 @@ app.post('/api/report', auth, async (req, res) => {
         currentStreak ?? null, nighttimePassed ?? null, schoolHoursPassed ?? null,
         isV6, dayMinutes ?? null]);
 
+    // השלמת ימים קודמים. אנדרואיד שומר במכשיר את כל השבוע ושולח גם אותו,
+    // כך שימים שלא סונכרנו, או שנשמר להם מספר חלקי, מתעדכנים לערך המלא.
+    // זמן מסך של יום שנסגר רק עולה, לכן נשמר המקסימום בין הקיים לחדש.
+    try {
+      const pastDays = Array.isArray(req.body.pastDays) ? req.body.pastDays.slice(0, 8) : [];
+      const todayMs = Date.parse(today);
+      for (const pd of pastDays) {
+        const date = String(pd?.date || '');
+        const minutes = parseInt(pd?.minutes);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+        if (!Number.isFinite(minutes) || minutes < 0 || minutes > 1440) continue;
+        const ageDays = (todayMs - Date.parse(date)) / 86400000;
+        if (!(ageDays >= 1 && ageDays <= 8)) continue;
+        await pool.query(`
+          INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, consent, platform,
+                                       report_date, synced_at, session_count, avg_session_seconds, goal_hours, day_minutes)
+          VALUES ($1,$2,0,0,'[]','{}',$3,$4,$5,0,0,$6,$7)
+          ON CONFLICT (student_id, report_date) DO UPDATE SET
+            day_minutes = GREATEST(COALESCE(reports_history.day_minutes, 0), EXCLUDED.day_minutes),
+            goal_hours = COALESCE(reports_history.goal_hours, EXCLUDED.goal_hours)
+        `, [genId(), req.session.user_id, platform || 'unknown', date,
+            syncedAt || new Date().toISOString(), goalHours ?? null, minutes]);
+      }
+    } catch (e) {
+      console.log('[report] pastDays error:', e.message);
+    }
+
     await evaluateBadges(req.session.user_id);
 
     res.json({ ok: true });
