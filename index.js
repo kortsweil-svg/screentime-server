@@ -26,8 +26,10 @@ try {
   console.log('[Firebase] init error:', e.message);
 }
 
+if (!process.env.DATABASE_URL) console.log('[DB] DATABASE_URL is not set!');
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://postgres.uzuluwhuvthpynoazaor:A13!039097518@aws-1-eu-west-2.pooler.supabase.com:6543/postgres',
+  // כתובת בסיס הנתונים נקראת רק ממשתנה הסביבה ב-Render. אסור לכתוב סיסמה בקוד - ה-repo ציבורי.
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
@@ -92,6 +94,7 @@ async function initDB() {
   `);
 
   // דירוג שבועי לפי מספר הימים שהתלמיד עמד ביעד, מיום א' עד אתמול (שעון ישראל).
+  // כל יום נמדד מול היעד שנשמר לו בהיסטוריה.
   // התלמידים מקובצים לפי מורה ויעד, כך שמשווים רק בין מי שבחרו אותו יעד.
   // קבוצה של פחות מ-3 תלמידים לא מדורגת. כשל ביצירת ה-VIEW לא מפיל את השרת.
   try {
@@ -110,8 +113,11 @@ async function initDB() {
       ),
       met AS (
         SELECT m.student_id, m.teacher_id, m.goal_hours,
+               -- כל יום נבדק מול היעד שהיה באותו יום, כדי ששינוי יעד באמצע השבוע
+               -- לא ישנה בדיעבד ימים שכבר נסגרו. בלי יעד שמור ליום - היעד הנוכחי.
                COUNT(h.student_id) FILTER (
-                 WHERE h.day_minutes IS NOT NULL AND h.day_minutes <= m.goal_hours * 60
+                 WHERE h.day_minutes IS NOT NULL
+                   AND h.day_minutes <= COALESCE(NULLIF(h.goal_hours::numeric, 0), m.goal_hours) * 60
                )::int AS days_met,
                COUNT(h.student_id) FILTER (WHERE h.day_minutes IS NOT NULL)::int AS days_reported
         FROM members m
