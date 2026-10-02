@@ -1004,9 +1004,27 @@ app.all('/api/send-daily-push', async (req, res) => {
 // ── בדיקת גרסה מינימלית נדרשת ──
 // האפליקציה שואלת בפתיחה. השרת מחזיר את הגרסה המינימלית שמותר לעבוד איתה.
 // כדי לחייב עדכון - פשוט משנים כאן את המספר (או דרך משתנה סביבה MIN_APP_VERSION ב-Render).
+// גרסה מינימלית לכל פלטפורמה בנפרד, עם קישור לחנות המתאימה.
+// משתני סביבה ב-Render: MIN_APP_VERSION_IOS, MIN_APP_VERSION_ANDROID.
+// MIN_APP_VERSION נשאר כברירת מחדל לשתיהן.
+// גרסאות ישנות שלא שולחות platform מזוהות לפי ה-User-Agent:
+// באייפון הבקשה יוצאת עם CFNetwork/Darwin, ובאנדרואיד עם okhttp.
+// כך ההפרדה עובדת מיד, בלי לעדכן את האפליקציה.
 app.get('/api/min-version', (req, res) => {
-  const minVersion = process.env.MIN_APP_VERSION || '5.0';
-  res.json({ minVersion, storeUrl: 'https://play.google.com/store/apps/details?id=com.screentimestudent2' });
+  const fallback = process.env.MIN_APP_VERSION || '5.0';
+  const ua = String(req.headers['user-agent'] || '');
+  let platform = String(req.query.platform || '').toLowerCase();
+  if (!platform) platform = /CFNetwork|Darwin|iPhone|iOS/i.test(ua) ? 'ios' : 'android';
+  if (platform === 'ios') {
+    return res.json({
+      minVersion: process.env.MIN_APP_VERSION_IOS || fallback,
+      storeUrl: 'https://apps.apple.com/app/id6811993215',
+    });
+  }
+  res.json({
+    minVersion: process.env.MIN_APP_VERSION_ANDROID || fallback,
+    storeUrl: 'https://play.google.com/store/apps/details?id=com.screentimestudent2',
+  });
 });
 
 const PORT = process.env.PORT || 3001;
