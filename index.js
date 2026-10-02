@@ -663,6 +663,41 @@ app.get('/api/report', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── iOS: תוצאה יומית מה-Monitor Extension ─────────────────────────────────
+// ה-extension שואל את אפל "כמה זמן באפליקציות היה היום" ב-23:30 (זמני) וב-00:01
+// (סופי, על היום שנגמר), ושולח לכאן גם כשהאפליקציה סגורה.
+// minutes = הסף הגבוה ביותר שנורה, כלומר גבול תחתון ברבעי שעה: הזמן האמיתי
+// נמצא בין minutes ל-minutes+15. ה-VIEW של הדירוג משווה day_minutes <= יעד,
+// ולכן שומרים minutes+1: סף שנורה בדיוק על היעד פירושו שהיעד נחצה.
+app.post('/api/ios-day', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const date = String(req.body.date || '');
+    const minutes = parseInt(req.body.minutes);
+    const goalMinutes = req.body.goalMinutes != null ? parseInt(req.body.goalMinutes) : NaN;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'bad date' });
+    if (!Number.isFinite(minutes) || minutes < 0 || minutes > 1440) return res.status(400).json({ error: 'bad minutes' });
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+    const ageDays = (Date.parse(today) - Date.parse(date)) / 86400000;
+    if (!(ageDays >= 0 && ageDays <= 8)) return res.status(400).json({ error: 'date out of range' });
+    const stored = minutes >= 15 ? minutes + 1 : minutes;
+    const goalHours = Number.isFinite(goalMinutes) && goalMinutes >= 0 ? goalMinutes / 60 : null;
+    await pool.query(`
+      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, consent, platform,
+                                   report_date, synced_at, session_count, avg_session_seconds, goal_hours, day_minutes)
+      VALUES ($1,$2,0,0,'[]','{}','ios',$3,$4,0,0,$5,$6)
+      ON CONFLICT (student_id, report_date) DO UPDATE SET
+        day_minutes = GREATEST(COALESCE(reports_history.day_minutes, 0), EXCLUDED.day_minutes),
+        goal_hours = COALESCE(EXCLUDED.goal_hours, reports_history.goal_hours)
+    `, [genId(), req.session.user_id, date, new Date().toISOString(), goalHours, stored]);
+    console.log(`[ios-day] ${req.session.user_id} ${date} ${minutes}m final=${!!req.body.final}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[ios-day] error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── שחזור היסטוריה לתלמיד אחרי התקנה מחדש ───────────────────────────────────
 // מחזיר את הדקות היומיות ששמורות בשרת, כדי שהאפליקציה תמזג אותן
 // להיסטוריה המקומית. באנדרואיד המכשיר עצמו הוא מקור אמין יותר לימים
