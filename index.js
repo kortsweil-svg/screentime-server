@@ -61,9 +61,6 @@ async function initDB() {
     ALTER TABLE students ADD COLUMN IF NOT EXISTS fcm_token TEXT;
     CREATE TABLE IF NOT EXISTS reports (
       student_id TEXT PRIMARY KEY REFERENCES students(id) ON DELETE CASCADE,
-      daily_average NUMERIC DEFAULT 0,
-      total_minutes INTEGER DEFAULT 0,
-      weekly_data JSONB DEFAULT '[0,0,0,0,0,0,0]',
       consent JSONB DEFAULT '{}',
       platform TEXT,
       synced_at TIMESTAMP DEFAULT NOW()
@@ -72,6 +69,7 @@ async function initDB() {
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS push_sent_at TIMESTAMP;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS sync_source TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS app_version TEXT;
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS goal_hours NUMERIC;
     -- דקות השימוש של אותו יום בלבד. total_minutes הוא שעות מצטברות
     -- ו-daily_average הוא ממוצע שבועי, אז אף אחד מהם לא מתאים לשחזור
     -- ההיסטוריה היומית אחרי התקנה מחדש.
@@ -287,34 +285,23 @@ app.post('/api/student/login', async (req, res) => {
 // ─── תלמידים (למורה) ─────────────────────────────────────────────────────────
 app.get('/api/students', auth, teacherOnly, async (req, res) => {
   try {
-    const today = new Date().toISOString().split('T')[0];
     const r = await pool.query(`
-      SELECT s.*, r.daily_average, r.weekly_data, r.synced_at, r.session_count, r.avg_session_seconds, r.push_status, r.push_sent_at, r.sync_source,
-             r.goal_hours, r.overall_goal_passed, r.wellness_score, m.mood
+      SELECT s.id, s.name, s.class_name, s.consent, s.active,
+             r.platform, r.synced_at, r.goal_hours, r.app_version
       FROM students s
       LEFT JOIN reports r ON s.id = r.student_id
-      LEFT JOIN mood_checks m ON s.id = m.student_id AND m.date = $2
       WHERE s.teacher_id = $1
       ORDER BY s.class_name, s.name
-    `, [req.session.teacher_id, today]);
+    `, [req.session.teacher_id]);
     res.json(r.rows.map(s => ({
       id: s.id, name: s.name,
       initials: s.name.split(' ').map((w) => w[0]).join('').slice(0, 2),
       className: s.class_name,
-      platform: 'android', consent: s.consent, active: s.active,
-      hours: parseFloat(s.daily_average) || 0,
-      weeklyData: s.weekly_data || [0,0,0,0,0,0,0],
+      consent: s.consent, active: s.active,
+      platform: s.platform || null,
       lastSync: s.synced_at || null,
-      mood: s.mood || null,
-      sessionCount: s.session_count || 0,
-      avgSessionSeconds: s.avg_session_seconds || 0,
-      pushStatus: s.push_status || null,
-      pushSentAt: s.push_sent_at || null,
-      syncSource: s.sync_source || null,
-      // ── חדש בגרסה 6.0 - שדות נוספים, לצד הישנים, לא במקומם ──
       goalHours: s.goal_hours !== null ? parseFloat(s.goal_hours) : null,
-      overallGoalPassed: s.overall_goal_passed,
-      wellnessScore: s.wellness_score,
+      appVersion: s.app_version || null,
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -385,81 +372,6 @@ app.delete('/api/students/:id', auth, teacherOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── תלמידים לפי טווח תאריכים ───────────────────────────────────────────────
-app.get('/api/students/range', auth, teacherOnly, async (req, res) => {
-  try {
-    const { from, to } = req.query;
-    const today = new Date().toISOString().split('T')[0];
-    const fromDate = from || today;
-    const toDate = to || today;
-
-    const r = await pool.query(`
-      SELECT s.id, s.name, s.class_name, s.consent,
-        AVG(h.daily_average) as avg_hours,
-        SUM(h.total_minutes) as total_minutes,
-        COUNT(h.report_date) as days_count,
-        SUM(h.session_count) as session_count,
-        AVG(NULLIF(h.avg_session_seconds,0)) as avg_session_seconds,
-        AVG(h.wellness_score) as avg_wellness_score,
-        COUNT(h.report_date) FILTER (WHERE h.overall_goal_passed) as days_goal_passed,
-        MAX(h.synced_at) as last_sync
-      FROM students s
-      LEFT JOIN reports_history h ON s.id = h.student_id
-        AND h.report_date >= $2 AND h.report_date <= $3
-      WHERE s.teacher_id = $1
-      GROUP BY s.id, s.name, s.class_name, s.consent
-      ORDER BY s.class_name, s.name
-    `, [req.session.teacher_id, fromDate, toDate]);
-
-    res.json(r.rows.map(s => ({
-      id: s.id, name: s.name,
-      initials: s.name.split(' ').map((w) => w[0]).join('').slice(0, 2),
-      className: s.class_name,
-      consent: s.consent,
-      hours: parseFloat(s.avg_hours) || 0,
-      totalMinutes: parseInt(s.total_minutes) || 0,
-      daysCount: parseInt(s.days_count) || 0,
-      sessionCount: parseInt(s.session_count) || 0,
-      avgSessionSeconds: Math.round(parseFloat(s.avg_session_seconds) || 0),
-      lastSync: s.last_sync || null,
-      // ── חדש בגרסה 6.0 ──
-      avgWellnessScore: Math.round(parseFloat(s.avg_wellness_score)) || null,
-      daysGoalPassed: parseInt(s.days_goal_passed) || 0,
-    })));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ─── היסטוריה ────────────────────────────────────────────────────────────────
-app.get('/api/history', auth, teacherOnly, async (req, res) => {
-  try {
-    const { range } = req.query;
-    let fromDate;
-    const now = new Date();
-    const today = now.toISOString().split('T')[0];
-    const yesterday = new Date(now); yesterday.setDate(yesterday.getDate()-1);
-    const yesterdayStr = yesterday.toISOString().split('T')[0];
-
-    if (range === 'today') fromDate = today;
-    else if (range === 'yesterday') fromDate = yesterdayStr;
-    else if (range === '7d') { const d=new Date(now); d.setDate(d.getDate()-7); fromDate=d.toISOString().split('T')[0]; }
-    else if (range === '30d') { const d=new Date(now); d.setDate(d.getDate()-30); fromDate=d.toISOString().split('T')[0]; }
-    else if (range === '90d') { const d=new Date(now); d.setDate(d.getDate()-90); fromDate=d.toISOString().split('T')[0]; }
-    else if (range === '180d') { const d=new Date(now); d.setDate(d.getDate()-180); fromDate=d.toISOString().split('T')[0]; }
-    else if (range === '365d') { const d=new Date(now); d.setDate(d.getDate()-365); fromDate=d.toISOString().split('T')[0]; }
-    else fromDate = '2020-01-01'; // מאז תמיד
-
-    const r = await pool.query(`
-      SELECT s.id, s.name, s.class_name, h.daily_average, h.weekly_data, h.report_date, h.synced_at,
-             h.goal_hours, h.overall_goal_passed, h.wellness_score
-      FROM students s
-      LEFT JOIN reports_history h ON s.id = h.student_id AND h.report_date >= $2
-      WHERE s.teacher_id = $1
-      ORDER BY s.class_name, s.name, h.report_date DESC
-    `, [req.session.teacher_id, fromDate]);
-    res.json({ rows: r.rows, range, fromDate, today, yesterday: yesterdayStr });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
 // ─── ממוצע כיתתי ─────────────────────────────────────────────────────────────
 app.get('/api/class-average', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
@@ -475,22 +387,16 @@ app.get('/api/class-average', auth, async (req, res) => {
     // רק דיווחים מהשבוע האחרון. בלי הסינון, תלמיד שלא פתח את
     // האפליקציה חודשים מזהם את הממוצע בנתון ישן.
     // ממוצע של 7 הימים הסגורים האחרונים לכל תלמיד, מתוך ההיסטוריה היומית.
-    // ב-iOS השדה daily_average מכיל את היום בלבד, ובאנדרואיד ממוצע שבועי -
-    // השוואה ישירה ביניהם מערבבת יום אחד עם שבוע. לכן: היסטוריה כשיש
-    // (iOS שולח day_minutes), ו-daily_average רק כגיבוי (אנדרואיד).
     const r = await pool.query(`
       WITH per AS (
         SELECT s.id,
-          COALESCE(
-            (SELECT AVG(d.dm) FROM (
-               SELECT MAX(h.day_minutes) AS dm
-               FROM reports_history h
-               WHERE h.student_id = s.id AND h.day_minutes > 0
-                 AND h.report_date::date BETWEEN CURRENT_DATE - 7 AND CURRENT_DATE - 1
-               GROUP BY h.report_date
-             ) d),
-            r.daily_average * 60
-          ) AS mins
+          (SELECT AVG(d.dm) FROM (
+             SELECT MAX(h.day_minutes) AS dm
+             FROM reports_history h
+             WHERE h.student_id = s.id AND h.day_minutes > 0
+               AND h.report_date::date BETWEEN CURRENT_DATE - 7 AND CURRENT_DATE - 1
+             GROUP BY h.report_date
+           ) d) AS mins
         FROM students s
         JOIN reports r ON s.id = r.student_id
         WHERE s.teacher_id = $1 AND s.class_name = $2
@@ -536,147 +442,37 @@ app.get('/api/mood/today', auth, async (req, res) => {
 // ─── דוחות ───────────────────────────────────────────────────────────────────
 // ── תגים (גרסה 6.0) ──
 // נבדק אחרי כל דיווח. תג שנפתח נשמר לתמיד ולא נמחק גם אם הרצף נשבר אחר כך.
-async function grantBadge(studentId, badgeType) {
-  await pool.query(
-    `INSERT INTO badges (student_id, badge_type, earned_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (student_id, badge_type) DO NOTHING`,
-    [studentId, badgeType]
-  );
-}
-
-async function evaluateBadges(studentId) {
-  try {
-    const cur = await pool.query(
-      'SELECT current_streak, nighttime_passed, school_hours_passed FROM reports WHERE student_id=$1',
-      [studentId]
-    );
-    if (!cur.rows.length) return;
-    const { current_streak, school_hours_passed } = cur.rows[0];
-
-    // 🎓 תלמיד מצטיין - 5 ימי לימוד *רצופים* עם ניתוק בשעות הלימודים.
-    // נספרים רק ראשון-חמישי (שישי ושבת מדולגים, החלון ריק בהם ממילא),
-    // והספירה נעצרת ביום הלימוד הראשון שלא עמד. מיושר ללוגיקה המקומית באפליקציה.
-    const schoolRows = await pool.query(
-      `SELECT school_hours_passed FROM reports_history
-       WHERE student_id=$1
-         AND EXTRACT(DOW FROM report_date::date) BETWEEN 0 AND 4
-       ORDER BY report_date::date DESC LIMIT 30`,
-      [studentId]
-    );
-    let schoolRun = 0;
-    for (const r of schoolRows.rows) {
-      if (r.school_hours_passed === true) schoolRun++;
-      else break;
-    }
-    if (schoolRun >= 5) await grantBadge(studentId, 'star_student');
-
-    // 🔥 רצף אש - אבני דרך
-    if (current_streak >= 7) await grantBadge(studentId, 'streak_fire_7');
-    if (current_streak >= 14) await grantBadge(studentId, 'streak_fire_14');
-    if (current_streak >= 30) await grantBadge(studentId, 'streak_fire_30');
-
-    // 🛡️ שומר הלילה - 5 ימים רצופים של לילה נקי.
-    // נספר רצף אמיתי לפי תאריכים עוקבים, לא רק 5 הרשומות האחרונות.
-    const nights = await pool.query(
-      `SELECT report_date FROM reports_history
-       WHERE student_id=$1 AND nighttime_passed = TRUE
-       ORDER BY report_date::date DESC LIMIT 5`,
-      [studentId]
-    );
-    if (nights.rows.length === 5) {
-      const dates = nights.rows.map(r => new Date(r.report_date));
-      const consecutive = dates.every((d, i) =>
-        i === 0 || Math.round((dates[i-1] - d) / 86400000) === 1
-      );
-      if (consecutive) await grantBadge(studentId, 'night_guardian');
-    }
-  } catch (e) {
-    console.error('[badges] error:', e.message);
-  }
-}
-
-// מחזיר לתלמיד את התגים שצבר
-app.get('/api/badges', auth, async (req, res) => {
-  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
-  try {
-    const r = await pool.query(
-      'SELECT badge_type, earned_at FROM badges WHERE student_id=$1 ORDER BY earned_at',
-      [req.session.user_id]
-    );
-    res.json(r.rows.map(b => ({ type: b.badge_type, earnedAt: b.earned_at })));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 app.post('/api/report', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
-  const {
-    dailyAverage, totalMinutes, weeklyData, consent, platform,
-    syncedAt, pushStatus, pushSentAt, syncSource, appVersion,
-    goalHours, overallGoalPassed, wellnessScore,
-    currentStreak, nighttimePassed, schoolHoursPassed, // ← נוספו בהמשך גרסה 6.0
-    dayMinutes, // ← דקות השימוש של היום הזה בלבד, לשחזור היסטוריה
-  } = req.body;
-  // האם הדיווח הגיע מגרסה שיודעת לשלוח את שדות 6.0.
-  // בלי ההבחנה הזו, ערך ריק לגיטימי (למשל יעד 0 = ללא מועדון) היה נחשב כ"לא נשלח"
-  // וה-COALESCE היה משאיר את הערך הישן לנצח.
-  const has = (k) => Object.prototype.hasOwnProperty.call(req.body, k);
-  const isV6 = has('goalHours') || has('wellnessScore') || has('currentStreak');
+  // גרסאות ישנות שולחות גם שדות שכבר לא נשמרים (ציון, רצף, ממוצעים) - מתעלמים מהם.
+  const { consent, platform, syncedAt, pushStatus, pushSentAt, syncSource, appVersion, goalHours, dayMinutes } = req.body;
+  // יעד נשמר רק כשהדיווח שלח אותו. גרסה ישנה מאוד בלי השדה לא תמחק יעד קיים.
+  const hasGoal = Object.prototype.hasOwnProperty.call(req.body, 'goalHours');
   try {
     if (consent) await pool.query('UPDATE students SET consent=$1 WHERE id=$2', [consent.total || false, req.session.user_id]);
     await pool.query(`
-      INSERT INTO reports (student_id, daily_average, total_minutes, weekly_data, consent, platform, synced_at, session_count, avg_session_seconds, push_status, push_sent_at, sync_source, app_version,
-                            goal_hours, overall_goal_passed, wellness_score,
-                            current_streak, nighttime_passed, school_hours_passed)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+      INSERT INTO reports (student_id, consent, platform, synced_at, push_status, push_sent_at, sync_source, app_version, goal_hours)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       ON CONFLICT (student_id) DO UPDATE SET
-        daily_average=$2, total_minutes=$3, weekly_data=$4, consent=$5, platform=$6, synced_at=$7, session_count=$8, avg_session_seconds=$9, push_status=$10, push_sent_at=$11, sync_source=$12, app_version=$13,
-        -- אם הדיווח הגיע מגרסה ישנה שלא שולחת את השדות האלה,
-        -- משאירים את הערך הקיים. אחרת כותבים בדיוק את מה שנשלח, כולל 0 או null.
-        goal_hours=CASE WHEN $20 THEN $14 ELSE reports.goal_hours END,
-        overall_goal_passed=CASE WHEN $20 THEN $15 ELSE reports.overall_goal_passed END,
-        wellness_score=CASE WHEN $20 THEN $16 ELSE reports.wellness_score END,
-        current_streak=CASE WHEN $20 THEN $17 ELSE reports.current_streak END,
-        nighttime_passed=CASE WHEN $20 THEN $18 ELSE reports.nighttime_passed END,
-        school_hours_passed=CASE WHEN $20 THEN $19 ELSE reports.school_hours_passed END
-    `, [req.session.user_id, dailyAverage || 0, totalMinutes || 0,
-        JSON.stringify(weeklyData || [0,0,0,0,0,0,0]),
-        JSON.stringify(consent || {}), platform || 'unknown',
+        consent=$2, platform=$3, synced_at=$4, push_status=$5, push_sent_at=$6, sync_source=$7, app_version=$8,
+        goal_hours=CASE WHEN $10 THEN $9 ELSE reports.goal_hours END
+    `, [req.session.user_id, JSON.stringify(consent || {}), platform || 'unknown',
         syncedAt || new Date().toISOString(),
-        parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
         pushStatus || null, pushSentAt || null, syncSource || null, appVersion || null,
-        goalHours ?? null, overallGoalPassed ?? null, wellnessScore ?? null,
-        currentStreak ?? null, nighttimePassed ?? null, schoolHoursPassed ?? null,
-        isV6]);
+        goalHours ?? null, hasGoal]);
 
-    // שמירה להיסטוריה יומית
-    // תאריך לפי שעון ישראל. לפי UTC, דיווח בין חצות ל-03:00 נרשם ליום הקודם.
+    // היסטוריה יומית - תאריך לפי שעון ישראל.
+    // iOS שולח דיווח קל בלי דקות: אז רק מעדכנים זמן סנכרון ויעד, והדקות מגיעות מ-/api/ios-day.
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
-    const histId = genId();
     await pool.query(`
-      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, consent, platform, report_date, synced_at, session_count, avg_session_seconds,
-                                    goal_hours, overall_goal_passed, wellness_score,
-                                    current_streak, nighttime_passed, school_hours_passed, day_minutes)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$19)
+      INSERT INTO reports_history (id, student_id, platform, report_date, synced_at, goal_hours, day_minutes)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
-        daily_average=EXCLUDED.daily_average, total_minutes=EXCLUDED.total_minutes, weekly_data=EXCLUDED.weekly_data, consent=EXCLUDED.consent, platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at, session_count=EXCLUDED.session_count, avg_session_seconds=EXCLUDED.avg_session_seconds,
-        goal_hours=CASE WHEN $18 THEN EXCLUDED.goal_hours ELSE reports_history.goal_hours END,
-        overall_goal_passed=CASE WHEN $18 THEN EXCLUDED.overall_goal_passed ELSE reports_history.overall_goal_passed END,
-        wellness_score=CASE WHEN $18 THEN EXCLUDED.wellness_score ELSE reports_history.wellness_score END,
-        current_streak=CASE WHEN $18 THEN EXCLUDED.current_streak ELSE reports_history.current_streak END,
-        nighttime_passed=CASE WHEN $18 THEN EXCLUDED.nighttime_passed ELSE reports_history.nighttime_passed END,
-        school_hours_passed=CASE WHEN $18 THEN EXCLUDED.school_hours_passed ELSE reports_history.school_hours_passed END,
-        -- נשמר רק כשנשלח ערך. גרסה ישנה או דיווח בלי נתון לא ידרסו
-        -- את מה שכבר נשמר היום.
+        platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at,
+        goal_hours=CASE WHEN $8 THEN EXCLUDED.goal_hours ELSE reports_history.goal_hours END,
         day_minutes=CASE WHEN EXCLUDED.day_minutes IS NOT NULL THEN EXCLUDED.day_minutes ELSE reports_history.day_minutes END
-    `, [histId, req.session.user_id, parseFloat(dailyAverage)||0, parseInt(totalMinutes)||0,
-        JSON.stringify(weeklyData||[0,0,0,0,0,0,0]),
-        JSON.stringify(consent||{}), platform||'unknown',
-        today, syncedAt||new Date().toISOString(),
-        parseInt(req.body.sessionCount)||0, parseInt(req.body.avgSessionSeconds)||0,
-        goalHours ?? null, overallGoalPassed ?? null, wellnessScore ?? null,
-        currentStreak ?? null, nighttimePassed ?? null, schoolHoursPassed ?? null,
-        isV6, dayMinutes ?? null]);
+    `, [genId(), req.session.user_id, platform || 'unknown', today,
+        syncedAt || new Date().toISOString(), goalHours ?? null, dayMinutes ?? null, hasGoal]);
 
     // השלמת ימים קודמים. אנדרואיד שומר במכשיר את כל השבוע ושולח גם אותו,
     // כך שימים שלא סונכרנו, או שנשמר להם מספר חלקי, מתעדכנים לערך המלא.
@@ -692,9 +488,8 @@ app.post('/api/report', auth, async (req, res) => {
         const ageDays = (todayMs - Date.parse(date)) / 86400000;
         if (!(ageDays >= 1 && ageDays <= 8)) continue;
         await pool.query(`
-          INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, consent, platform,
-                                       report_date, synced_at, session_count, avg_session_seconds, goal_hours, day_minutes)
-          VALUES ($1,$2,0,0,'[]','{}',$3,$4,$5,0,0,$6,$7)
+          INSERT INTO reports_history (id, student_id, platform, report_date, synced_at, goal_hours, day_minutes)
+          VALUES ($1,$2,$3,$4,$5,$6,$7)
           ON CONFLICT (student_id, report_date) DO UPDATE SET
             day_minutes = GREATEST(COALESCE(reports_history.day_minutes, 0), EXCLUDED.day_minutes),
             goal_hours = COALESCE(reports_history.goal_hours, EXCLUDED.goal_hours)
@@ -704,8 +499,6 @@ app.post('/api/report', auth, async (req, res) => {
     } catch (e) {
       console.log('[report] pastDays error:', e.message);
     }
-
-    await evaluateBadges(req.session.user_id);
 
     res.json({ ok: true });
   } catch (e) { 
@@ -742,9 +535,8 @@ app.post('/api/ios-day', auth, async (req, res) => {
     const stored = minutes >= 15 ? minutes + 1 : minutes;
     const goalHours = Number.isFinite(goalMinutes) && goalMinutes >= 0 ? goalMinutes / 60 : null;
     await pool.query(`
-      INSERT INTO reports_history (id, student_id, daily_average, total_minutes, weekly_data, consent, platform,
-                                   report_date, synced_at, session_count, avg_session_seconds, goal_hours, day_minutes)
-      VALUES ($1,$2,0,0,'[]','{}','ios',$3,$4,0,0,$5,$6)
+      INSERT INTO reports_history (id, student_id, platform, report_date, synced_at, goal_hours, day_minutes)
+      VALUES ($1,$2,'ios',$3,$4,$5,$6)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
         day_minutes = GREATEST(COALESCE(reports_history.day_minutes, 0), EXCLUDED.day_minutes),
         goal_hours = COALESCE(EXCLUDED.goal_hours, reports_history.goal_hours)
@@ -778,41 +570,6 @@ app.get('/api/my-history', auth, async (req, res) => {
         minutes: x.day_minutes,
       })),
       lastSync: r.rows[0]?.synced_at || null,
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ─── חדש בגרסה 6.0: דירוג כיתתי - מחזיר לתלמיד רק את המיקום שלו עצמו ───
-app.get('/api/class-rank', auth, async (req, res) => {
-  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
-  try {
-    const r = await pool.query(
-      'SELECT class_rank, class_size, avg_score, class_name FROM class_rank_current_week WHERE student_id=$1',
-      [req.session.user_id]
-    );
-    if (!r.rows.length) return res.status(404).json({ error: 'אין עדיין דירוג לשבוע הנוכחי' });
-    const row = r.rows[0];
-
-    // כמה תלמידים חולקים את אותו ציון. כשכולם שווים הדירוג חסר
-    // משמעות - כל אחד "במקום הראשון" - והאפליקציה מסתירה את הכרטיס.
-    const tie = await pool.query(
-      `SELECT COUNT(*)::int AS n, COUNT(DISTINCT avg_score)::int AS distinct_scores
-       FROM class_rank_current_week
-       WHERE class_name = $1 AND avg_score = $2`,
-      [row.class_name, row.avg_score]
-    );
-    const all = await pool.query(
-      `SELECT COUNT(DISTINCT avg_score)::int AS distinct_scores
-       FROM class_rank_current_week WHERE class_name = $1`,
-      [row.class_name]
-    );
-
-    res.json({
-      rank: row.class_rank,
-      classSize: row.class_size,
-      avgScore: row.avg_score,
-      sharedWith: (tie.rows[0]?.n || 1) - 1,
-      distinctScores: all.rows[0]?.distinct_scores || 1,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
