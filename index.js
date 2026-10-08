@@ -307,8 +307,9 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
 });
 
 // ─── דשבורד מורה: סקירה לפי ימי עמידה ביעד ─────────────────────────────────
-// לכל תלמיד: יעד, פלטפורמה, סנכרון אחרון, דירוג השבוע, ו-28 הימים האחרונים
-// (דקות ויעד לכל יום). תלמיד בלי הסכמה מקבל רשימת ימים ריקה.
+// לכל תלמיד: יעד, פלטפורמה, סנכרון אחרון, דירוג השבוע, וכל הימים מתחילת השנה
+// (דקות ויעד לכל יום), כדי שהדשבורד יחשב כוכבים וגביעים באותם כללים כמו האפליקציה.
+// תלמיד בלי הסכמה מקבל רשימת ימים ריקה.
 app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
   try {
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
@@ -331,7 +332,7 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
       JOIN students s ON s.id = h.student_id
       WHERE s.teacher_id = $1
         AND s.consent = TRUE
-        AND h.report_date::date >= ($2::date - 27)
+        AND h.report_date::date >= (date_trunc('year', $2::date)::date - 7)
         AND h.day_minutes IS NOT NULL
       ORDER BY h.report_date
     `, [req.session.teacher_id, today]);
