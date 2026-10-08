@@ -319,6 +319,65 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── דשבורד מורה: סקירה לפי ימי עמידה ביעד ─────────────────────────────────
+// לכל תלמיד: יעד, פלטפורמה, סנכרון אחרון, דירוג השבוע, ו-28 הימים האחרונים
+// (דקות ויעד לכל יום). תלמיד בלי הסכמה מקבל רשימת ימים ריקה.
+app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
+  try {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+    const dow = new Date(today + 'T12:00:00Z').getUTCDay();
+    const ws = new Date(today + 'T12:00:00Z'); ws.setUTCDate(ws.getUTCDate() - dow);
+    const weekStart = ws.toISOString().slice(0, 10);
+    const st = await pool.query(`
+      SELECT s.id, s.name, s.class_name, s.consent, s.active,
+             r.goal_hours, r.platform, r.synced_at, r.app_version,
+             g.days_met, g.days_reported, g.goal_rank, g.group_size
+      FROM students s
+      LEFT JOIN reports r ON r.student_id = s.id
+      LEFT JOIN goal_rank_current_week g ON g.student_id = s.id
+      WHERE s.teacher_id = $1
+      ORDER BY s.class_name, s.name
+    `, [req.session.teacher_id]);
+    const hist = await pool.query(`
+      SELECT h.student_id, h.report_date::date::text AS d, h.day_minutes, h.goal_hours
+      FROM reports_history h
+      JOIN students s ON s.id = h.student_id
+      WHERE s.teacher_id = $1
+        AND s.consent = TRUE
+        AND h.report_date::date >= ($2::date - 27)
+        AND h.day_minutes IS NOT NULL
+      ORDER BY h.report_date
+    `, [req.session.teacher_id, today]);
+    const byStudent = {};
+    for (const h of hist.rows) {
+      (byStudent[h.student_id] = byStudent[h.student_id] || []).push({
+        date: h.d,
+        minutes: h.day_minutes,
+        goalHours: h.goal_hours !== null ? parseFloat(h.goal_hours) : null,
+      });
+    }
+    res.json({
+      today, weekStart,
+      students: st.rows.map(s => ({
+        id: s.id, name: s.name, className: s.class_name,
+        consent: s.consent, active: s.active,
+        goalHours: s.goal_hours !== null ? parseFloat(s.goal_hours) : null,
+        platform: s.platform || null,
+        lastSync: s.synced_at || null,
+        appVersion: s.app_version || null,
+        daysMet: s.days_met ?? null,
+        daysReported: s.days_reported ?? null,
+        rank: s.goal_rank ?? null,
+        groupSize: s.group_size ?? null,
+        days: s.consent ? (byStudent[s.id] || []) : [],
+      })),
+    });
+  } catch (e) {
+    console.error('[teacher/overview]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.delete('/api/students/:id', auth, teacherOnly, async (req, res) => {
   try {
     await pool.query('DELETE FROM students WHERE id=$1 AND teacher_id=$2', [req.params.id, req.session.teacher_id]);
