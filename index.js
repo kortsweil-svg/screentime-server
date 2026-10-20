@@ -608,6 +608,9 @@ app.post('/api/update-fcm-token', auth, async (req, res) => {
   const { fcmToken } = req.body;
   if (!fcmToken) return res.status(400).json({ error: 'חסר טוקן' });
   try {
+    // מכשיר אחד = תלמיד אחד: אם אותו טוקן רשום אצל תלמיד אחר (אותו טלפון שנכנס
+    // בעבר בשם אחר או בכיתה אחרת), מוחקים אותו שם - אחרת הפוש מגיע פעמיים.
+    await pool.query('UPDATE students SET fcm_token=NULL WHERE fcm_token=$1 AND id<>$2', [fcmToken, req.session.user_id]);
     await pool.query('UPDATE students SET fcm_token=$1 WHERE id=$2', [fcmToken, req.session.user_id]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -647,7 +650,12 @@ async function sendSilentPushToAll(period, platform) {
   const invalidTokens = [];
   const failures = [];
 
+  // הגנה נוספת: לא שולחים פעמיים לאותו מכשיר, גם אם הטוקן עדיין רשום אצל שני תלמידים
+  const seenTokens = new Set();
+  let skippedDup = 0;
   for (const student of r.rows) {
+    if (seenTokens.has(student.fcm_token)) { skippedDup++; continue; }
+    seenTokens.add(student.fcm_token);
     try {
       // פוש הבוקר הוא התראה רגילה ולא שקטה: כל מה שהוא צריך זה היעד,
       // והיעד שמור בשרת. התראה רגילה מגיעה תמיד, גם כשהאפליקציה נסגרה בהחלקה.
@@ -702,8 +710,8 @@ async function sendSilentPushToAll(period, platform) {
     await pool.query('UPDATE students SET fcm_token=NULL WHERE id = ANY($1)', [invalidTokens]);
   }
 
-  console.log(`[FCM] period=${period} platform=${platform || 'all'} sent=${sent} failed=${failed} cleaned=${invalidTokens.length}`);
-  return { sent, failed, cleaned: invalidTokens.length, failures };
+  console.log(`[FCM] period=${period} platform=${platform || 'all'} sent=${sent} failed=${failed} cleaned=${invalidTokens.length} dup=${skippedDup}`);
+  return { sent, failed, cleaned: invalidTokens.length, skippedDup, failures };
 }
 
 const MORNING_CHEERS = [
