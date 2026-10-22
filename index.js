@@ -81,6 +81,7 @@ async function initDB() {
       teacher_id TEXT NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NOW();
     CREATE TABLE IF NOT EXISTS mood_checks (
       id TEXT PRIMARY KEY,
       student_id TEXT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -152,8 +153,16 @@ function genCode() { return Math.floor(100000 + Math.random() * 900000).toString
 
 async function getSession(token) {
   const r = await pool.query('SELECT * FROM sessions WHERE token=$1', [token]);
-  return r.rows[0] || null;
+  const sess = r.rows[0] || null;
+  // מורה: מסמנים שהחיבור פעיל (לכל היותר פעם בדקה)
+  if (sess && sess.role === 'teacher' && (!sess.last_seen || Date.now() - new Date(sess.last_seen).getTime() > 60000)) {
+    pool.query('UPDATE sessions SET last_seen=NOW() WHERE token=$1', [token]).catch(() => {});
+  }
+  return sess;
 }
+
+// חיבור מורה נחשב פעיל אם היה בו שימוש ב-30 הדקות האחרונות
+const TEACHER_ACTIVE_MIN = 30;
 
 function auth(req, res, next) {
   const token = req.headers['authorization']?.replace('Bearer ', '');
@@ -200,10 +209,31 @@ app.post('/api/teacher/login', async (req, res) => {
     const teacher = r.rows[0];
     if (!teacher || teacher.password_hash !== hash(password))
       return res.status(401).json({ error: 'שם משתמש או סיסמה שגויים' });
+    // משתמש אחד בכל פעם: אם מישהו כבר מחובר לחשבון הזה - לא נותנים להיכנס
+    const active = await pool.query(
+      `SELECT 1 FROM sessions WHERE user_id=$1 AND role='teacher'
+         AND COALESCE(last_seen, created_at) > NOW() - ($2 || ' minutes')::interval LIMIT 1`,
+      [teacher.id, String(TEACHER_ACTIVE_MIN)]);
+    if (active.rows.length)
+      return res.status(409).json({ error: `מישהו כבר מחובר לחשבון הזה ממכשיר אחר. אפשר להיכנס אחרי שיתנתק, או אחרי ${TEACHER_ACTIVE_MIN} דקות בלי שימוש.` });
+    // חיבורים ישנים של החשבון (שלא היו פעילים) נמחקים
+    await pool.query("DELETE FROM sessions WHERE user_id=$1 AND role='teacher'", [teacher.id]);
     const token = genToken();
     await pool.query('INSERT INTO sessions (token,user_id,role,teacher_id) VALUES ($1,$2,$3,$4)',
       [token, teacher.id, 'teacher', teacher.id]);
     res.json({ ok: true, token, teacher: { id: teacher.id, username: teacher.username, name: teacher.name, institutionCode: teacher.institution_code } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// דופק קל מהלוח הפתוח: שומר את החיבור "פעיל"
+app.get('/api/teacher/ping', auth, teacherOnly, (req, res) => res.json({ ok: true }));
+
+// ─── התנתקות מורה (משחררת את החשבון למכשיר אחר) ──────────────────────────────
+app.post('/api/teacher/logout', auth, async (req, res) => {
+  try {
+    const token = req.headers['authorization']?.replace('Bearer ', '');
+    await pool.query('DELETE FROM sessions WHERE token=$1', [token]);
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -269,16 +299,59 @@ async function normalizeExistingClasses() {
   } catch (e) { console.log('[classes] normalize failed', e.message); }
 }
 
+
+// ─── שם משתמש אחיד ומיזוג כפילויות ─────────────────────────────────────────
+// "Asaf", "asaf", " asaf " → "asaf". תלמיד שנרשם פעמיים עם אותו שם משתמש וסיסמה
+// (בהבדלי אותיות גדולות/רווחים) הופך לחשבון אחד.
+function normUser(u) { return String(u || '').trim().toLowerCase(); }
+
+async function mergeDuplicateStudents() {
+  try {
+    const groups = await pool.query(`
+      SELECT LOWER(TRIM(username)) AS u, password_hash, ARRAY_AGG(id) AS ids
+      FROM students GROUP BY LOWER(TRIM(username)), password_hash HAVING COUNT(*) > 1`);
+    let merged = 0;
+    for (const g of groups.rows) {
+      // החשבון שנשאר: זה עם הנתון האחרון בהיסטוריה (ואם אין - זה עם מזהה פוש)
+      const k = await pool.query(`
+        SELECT s.id FROM students s
+        LEFT JOIN (SELECT student_id, MAX(report_date::date) AS last FROM reports_history GROUP BY student_id) h ON h.student_id = s.id
+        WHERE s.id = ANY($1)
+        ORDER BY h.last DESC NULLS LAST, (s.fcm_token IS NOT NULL) DESC, s.id`, [g.ids]);
+      const keep = k.rows[0].id;
+      for (const other of g.ids.filter(id => id !== keep)) {
+        // ימים שקיימים רק בחשבון הכפול עוברים לחשבון שנשאר
+        await pool.query(`UPDATE reports_history SET student_id=$1 WHERE student_id=$2
+          AND report_date NOT IN (SELECT report_date FROM reports_history WHERE student_id=$1)`, [keep, other]);
+        await pool.query('DELETE FROM reports_history WHERE student_id=$1', [other]);
+        // טלפון שמחובר לחשבון הכפול ממשיך לעבוד - מעכשיו מול החשבון שנשאר
+        await pool.query('UPDATE sessions SET user_id=$1 WHERE user_id=$2', [keep, other]);
+        await pool.query(`UPDATE students SET fcm_token = COALESCE(fcm_token, (SELECT fcm_token FROM students WHERE id=$2))
+          WHERE id=$1`, [keep, other]);
+        await pool.query('UPDATE students SET fcm_token=NULL WHERE id=$1', [other]);
+        await pool.query('DELETE FROM students WHERE id=$1', [other]);
+        merged++;
+      }
+    }
+    // שמות משתמש קיימים → צורה אחידה (רק כשאין התנגשות)
+    await pool.query(`UPDATE students s SET username = LOWER(TRIM(s.username))
+      WHERE s.username <> LOWER(TRIM(s.username))
+        AND NOT EXISTS (SELECT 1 FROM students x WHERE x.id <> s.id AND x.username = LOWER(TRIM(s.username)))`);
+    console.log(`[students] merged ${merged} duplicate accounts`);
+  } catch (e) { console.log('[students] merge failed', e.message); }
+}
+
 // ─── רישום תלמיד ──────────────────────────────────────────────────────────────
 app.post('/api/student/register', async (req, res) => {
-  const { institutionCode, username, password, name } = req.body;
+  const { institutionCode, password, name } = req.body;
+  const username = normUser(req.body.username);
   const className = normClass(req.body.className);
   if (!institutionCode || !username || !password || !name || !className)
     return res.status(400).json({ error: 'חסרים פרטים' });
   try {
     const teacher = await pool.query('SELECT * FROM teachers WHERE institution_code=$1', [institutionCode]);
     if (!teacher.rows.length) return res.status(404).json({ error: 'קוד מוסד לא תקף' });
-    const exists = await pool.query('SELECT id FROM students WHERE username=$1', [username]);
+    const exists = await pool.query('SELECT id FROM students WHERE LOWER(TRIM(username))=$1', [username]);
     if (exists.rows.length) return res.status(400).json({ error: 'שם המשתמש תפוס' });
     const id = genId();
     const teacherId = teacher.rows[0].id;
@@ -296,10 +369,11 @@ app.post('/api/student/register', async (req, res) => {
 
 // ─── התחברות תלמיד ────────────────────────────────────────────────────────────
 app.post('/api/student/login', async (req, res) => {
-  const { username, password } = req.body;
+  const { password } = req.body;
+  const username = normUser(req.body.username);
   try {
-    const r = await pool.query('SELECT s.*, t.name as teacher_name FROM students s LEFT JOIN teachers t ON s.teacher_id=t.id WHERE s.username=$1', [username]);
-    const student = r.rows[0];
+    const r = await pool.query('SELECT s.*, t.name as teacher_name FROM students s LEFT JOIN teachers t ON s.teacher_id=t.id WHERE LOWER(TRIM(s.username))=$1', [username]);
+    const student = r.rows.find(x => x.password_hash === hash(password)) || r.rows[0];
     if (!student || student.password_hash !== hash(password))
       return res.status(401).json({ error: 'שם משתמש או סיסמה שגויים' });
     const token = genToken();
@@ -885,6 +959,7 @@ app.get('/api/min-version', (req, res) => {
 const PORT = process.env.PORT || 3001;
 initDB().then(async () => {
   await normalizeExistingClasses();
+  await mergeDuplicateStudents();
   app.listen(PORT, () => console.log(`Server on port ${PORT}`));
   const SIX_DAYS = 6 * 24 * 60 * 60 * 1000;
   setInterval(async () => {
