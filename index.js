@@ -132,6 +132,9 @@ async function initDB() {
                DENSE_RANK() OVER (PARTITION BY teacher_id, goal_hours ORDER BY days_met DESC)::int AS goal_rank,
                COUNT(*) OVER (PARTITION BY teacher_id, goal_hours)::int AS group_size
         FROM met
+        -- מדרגים רק תלמידים שיש להם לפחות יום מדידה אחד השבוע (תלמיד חדש באייפון
+        -- מתחיל להימדד רק מהלילה הראשון - לא נדרג אותו מול מי שיש לו שבוע שלם)
+        WHERE met.days_reported > 0
       )
       SELECT * FROM ranked WHERE group_size >= 3;
     `);
@@ -240,9 +243,36 @@ app.get('/api/institution/:code', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ─── שם כיתה אחיד ───────────────────────────────────────────────────────────
+// "יא", "י״א", "י\"א", "י'א", "יא 1", "י״א-1" → "י״א" / "י״א1". אותיות בודדות: "ט" → "ט׳".
+function normClass(c) {
+  const raw = String(c || '').trim();
+  const t = raw.replace(/["'״׳`’‘”“]/g, '').replace(/[\s\-_.\/]/g, '');
+  const m = t.match(/^([\u05D0-\u05EA]{1,3})(\d*)$/);
+  if (!m) return raw;
+  const L = m[1], n = m[2];
+  const heb = L.length === 1 ? L + '׳' : L.slice(0, -1) + '״' + L.slice(-1);
+  return heb + n;
+}
+
+// פעם אחת בעלייה: מאחדים את שמות הכיתות שכבר שמורים
+async function normalizeExistingClasses() {
+  try {
+    const r = await pool.query('SELECT id, class_name FROM students');
+    let n = 0;
+    for (const row of r.rows) {
+      const c = normClass(row.class_name);
+      if (c !== row.class_name) { await pool.query('UPDATE students SET class_name=$1 WHERE id=$2', [c, row.id]); n++; }
+    }
+    console.log(`[classes] normalized ${n} of ${r.rows.length}`);
+  } catch (e) { console.log('[classes] normalize failed', e.message); }
+}
+
 // ─── רישום תלמיד ──────────────────────────────────────────────────────────────
 app.post('/api/student/register', async (req, res) => {
-  const { institutionCode, username, password, name, className } = req.body;
+  const { institutionCode, username, password, name } = req.body;
+  const className = normClass(req.body.className);
   if (!institutionCode || !username || !password || !name || !className)
     return res.status(400).json({ error: 'חסרים פרטים' });
   try {
@@ -853,7 +883,8 @@ app.get('/api/min-version', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-initDB().then(() => {
+initDB().then(async () => {
+  await normalizeExistingClasses();
   app.listen(PORT, () => console.log(`Server on port ${PORT}`));
   const SIX_DAYS = 6 * 24 * 60 * 60 * 1000;
   setInterval(async () => {
