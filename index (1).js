@@ -132,6 +132,9 @@ async function initDB() {
                DENSE_RANK() OVER (PARTITION BY teacher_id, goal_hours ORDER BY days_met DESC)::int AS goal_rank,
                COUNT(*) OVER (PARTITION BY teacher_id, goal_hours)::int AS group_size
         FROM met
+        -- מדרגים רק תלמידים שיש להם לפחות יום מדידה אחד השבוע (תלמיד חדש באייפון
+        -- מתחיל להימדד רק מהלילה הראשון - לא נדרג אותו מול מי שיש לו שבוע שלם)
+        WHERE met.days_reported > 0
       )
       SELECT * FROM ranked WHERE group_size >= 3;
     `);
