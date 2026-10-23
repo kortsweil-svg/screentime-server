@@ -82,6 +82,7 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     );
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NOW();
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS nav_excluded BOOLEAN;
     CREATE TABLE IF NOT EXISTS mood_checks (
       id TEXT PRIMARY KEY,
       student_id TEXT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -274,6 +275,8 @@ app.get('/api/institution/:code', async (req, res) => {
 });
 
 
+function verNum(v) { const n = parseFloat(String(v || '').replace(/[^0-9.]/g, '')); return isNaN(n) ? 0 : n; }
+
 // ─── שם כיתה אחיד ───────────────────────────────────────────────────────────
 // "יא", "י״א", "י\"א", "י'א", "יא 1", "י״א-1" → "י״א" / "י״א1". אותיות בודדות: "ט" → "ט׳".
 function normClass(c) {
@@ -422,7 +425,7 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
     const weekStart = ws.toISOString().slice(0, 10);
     const st = await pool.query(`
       SELECT s.id, s.name, s.class_name, s.consent, s.active,
-             r.goal_hours, r.platform, r.synced_at, r.app_version,
+             r.goal_hours, r.platform, r.synced_at, r.app_version, r.nav_excluded,
              g.days_met, g.days_reported, g.goal_rank, g.group_size
       FROM students s
       LEFT JOIN reports r ON r.student_id = s.id
@@ -457,6 +460,10 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
         platform: s.platform || null,
         lastSync: s.synced_at || null,
         appVersion: s.app_version || null,
+        // ניכוי ניווט ותפילה: אנדרואיד 6.68+ אוטומטי; אייפון - רק מה שהאפליקציה דיווחה (6.70+)
+        navExcluded: s.platform === 'android'
+          ? (verNum(s.app_version) >= 6.68 ? true : false)
+          : (s.nav_excluded === true ? true : s.nav_excluded === false ? false : null),
         daysMet: s.days_met ?? null,
         daysReported: s.days_reported ?? null,
         rank: s.goal_rank ?? null,
@@ -551,6 +558,8 @@ app.post('/api/report', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   // גרסאות ישנות שולחות גם שדות שכבר לא נשמרים (ציון, רצף, ממוצעים) - מתעלמים מהם.
   const { consent, platform, syncedAt, pushStatus, pushSentAt, syncSource, appVersion, goalHours, dayMinutes } = req.body;
+  // iOS 6.70+: האם התלמיד הפעיל (ואימת) את ניכוי הניווט והתפילה
+  const hasNav = typeof req.body.navExcluded === 'boolean';
   // יעד נשמר רק כשהדיווח שלח אותו. גרסה ישנה מאוד בלי השדה לא תמחק יעד קיים.
   const hasGoal = Object.prototype.hasOwnProperty.call(req.body, 'goalHours');
   try {
@@ -565,6 +574,7 @@ app.post('/api/report', auth, async (req, res) => {
         syncedAt || new Date().toISOString(),
         pushStatus || null, pushSentAt || null, syncSource || null, appVersion || null,
         goalHours ?? null, hasGoal]);
+    if (hasNav) await pool.query('UPDATE reports SET nav_excluded=$1 WHERE student_id=$2', [req.body.navExcluded, req.session.user_id]);
 
     // היסטוריה יומית - תאריך לפי שעון ישראל.
     // iOS שולח דיווח קל בלי דקות: אז רק מעדכנים זמן סנכרון ויעד, והדקות מגיעות מ-/api/ios-day.
