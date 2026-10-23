@@ -477,6 +477,20 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
   }
 });
 
+// עריכת פרטי תלמיד ע"י המורה/המנהל: שם וכיתה
+app.patch('/api/students/:id', auth, teacherOnly, async (req, res) => {
+  try {
+    const name = String(req.body.name || '').trim().replace(/\s+/g, ' ');
+    const className = normClass(req.body.className);
+    if (!name) return res.status(400).json({ error: 'חסר שם' });
+    if (!className) return res.status(400).json({ error: 'חסרה כיתה' });
+    const r = await pool.query('UPDATE students SET name=$1, class_name=$2 WHERE id=$3 AND teacher_id=$4 RETURNING id',
+      [name, className, req.params.id, req.session.teacher_id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'תלמיד לא נמצא' });
+    res.json({ ok: true, name, className });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.delete('/api/students/:id', auth, teacherOnly, async (req, res) => {
   try {
     await pool.query('DELETE FROM students WHERE id=$1 AND teacher_id=$2', [req.params.id, req.session.teacher_id]);
@@ -615,7 +629,9 @@ app.post('/api/report', auth, async (req, res) => {
       console.log('[report] pastDays error:', e.message);
     }
 
-    res.json({ ok: true });
+    // השם והכיתה העדכניים (אם המורה תיקן אותם בלוח - האפליקציה מתעדכנת)
+    const me = await pool.query('SELECT name, class_name FROM students WHERE id=$1', [req.session.user_id]);
+    res.json({ ok: true, name: me.rows[0]?.name, className: me.rows[0]?.class_name });
   } catch (e) { 
     console.error('[report] error:', e.message);
     res.status(500).json({ error: e.message }); 
