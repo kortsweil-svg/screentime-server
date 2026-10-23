@@ -669,9 +669,11 @@ app.post('/api/ios-day', auth, async (req, res) => {
       INSERT INTO reports_history (id, student_id, platform, report_date, synced_at, goal_hours, day_minutes)
       VALUES ($1,$2,'ios',$3,$4,$5,$6)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
-        day_minutes = GREATEST(COALESCE(reports_history.day_minutes, 0), EXCLUDED.day_minutes),
+        -- תוצאת השחר (final) קובעת; תוצאת לילה רק מעלה
+        day_minutes = CASE WHEN $7 THEN EXCLUDED.day_minutes
+                           ELSE GREATEST(COALESCE(reports_history.day_minutes, 0), EXCLUDED.day_minutes) END,
         goal_hours = COALESCE(EXCLUDED.goal_hours, reports_history.goal_hours)
-    `, [genId(), req.session.user_id, date, new Date().toISOString(), goalHours, stored]);
+    `, [genId(), req.session.user_id, date, new Date().toISOString(), goalHours, stored, !!req.body.final]);
     console.log(`[ios-day] ${req.session.user_id} ${date} ${minutes}m final=${!!req.body.final}`);
     res.json({ ok: true });
   } catch (e) {
@@ -984,9 +986,12 @@ app.get('/api/min-version', (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 initDB().then(async () => {
-  await normalizeExistingClasses();
-  await mergeDuplicateStudents();
+  // קודם פותחים את הפורט (Render מסיים את הפריסה רק כשהשרת מאזין), ורק אחר כך תחזוקה ברקע
   app.listen(PORT, () => console.log(`Server on port ${PORT}`));
+  (async () => {
+    await normalizeExistingClasses();
+    await mergeDuplicateStudents();
+  })().catch(e => console.log('[maintenance] failed', e.message));
   const SIX_DAYS = 6 * 24 * 60 * 60 * 1000;
   setInterval(async () => {
     try {
