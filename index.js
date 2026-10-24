@@ -83,6 +83,15 @@ async function initDB() {
     );
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NOW();
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS nav_excluded BOOLEAN;
+    CREATE TABLE IF NOT EXISTS teacher_access (
+      id SERIAL PRIMARY KEY,
+      teacher_id TEXT,
+      username TEXT,
+      event TEXT,
+      user_agent TEXT,
+      ip TEXT,
+      at TIMESTAMP DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS mood_checks (
       id TEXT PRIMARY KEY,
       student_id TEXT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -222,7 +231,18 @@ app.post('/api/teacher/login', async (req, res) => {
     const token = genToken();
     await pool.query('INSERT INTO sessions (token,user_id,role,teacher_id) VALUES ($1,$2,$3,$4)',
       [token, teacher.id, 'teacher', teacher.id]);
+    logTeacherAccess(req, teacher.id, teacher.username, 'login');
     res.json({ ok: true, token, teacher: { id: teacher.id, username: teacher.username, name: teacher.name, institutionCode: teacher.institution_code } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// יומן הכניסות והצפיות בלוח (60 הימים האחרונים, עד 100 רשומות)
+app.get('/api/teacher/access', auth, teacherOnly, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT username, event, user_agent, at FROM teacher_access WHERE teacher_id=$1 ORDER BY at DESC LIMIT 100`,
+      [req.session.teacher_id]);
+    res.json({ ok: true, entries: r.rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -276,6 +296,18 @@ app.get('/api/institution/:code', async (req, res) => {
 
 
 function verNum(v) { const n = parseFloat(String(v || '').replace(/[^0-9.]/g, '')); return isNaN(n) ? 0 : n; }
+
+// ─── יומן כניסות וצפיות בלוח המורה ─────────────────────────────────────────
+// כניסה נרשמת תמיד; צפייה - לכל היותר פעם ב-30 דקות לכל חיבור.
+const lastViewLog = new Map();
+async function logTeacherAccess(req, teacherId, username, event) {
+  try {
+    const ip = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0].trim();
+    await pool.query('INSERT INTO teacher_access (teacher_id, username, event, user_agent, ip) VALUES ($1,$2,$3,$4,$5)',
+      [teacherId, username || null, event, String(req.headers['user-agent'] || '').slice(0, 300), ip]);
+    await pool.query(`DELETE FROM teacher_access WHERE teacher_id=$1 AND at < NOW() - INTERVAL '60 days'`, [teacherId]);
+  } catch (e) { console.log('[access] log failed', e.message); }
+}
 
 // ─── שם כיתה אחיד ───────────────────────────────────────────────────────────
 // "יא", "י״א", "י\"א", "י'א", "יא 1", "י״א-1" → "י״א" / "י״א1". אותיות בודדות: "ט" → "ט׳".
@@ -419,6 +451,15 @@ app.get('/api/students', auth, teacherOnly, async (req, res) => {
 // תלמיד בלי הסכמה מקבל רשימת ימים ריקה.
 app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
   try {
+    {
+      const tok = req.headers['authorization']?.replace('Bearer ', '') || '';
+      const last = lastViewLog.get(tok) || 0;
+      if (Date.now() - last > 30 * 60 * 1000) {
+        lastViewLog.set(tok, Date.now());
+        const t = await pool.query('SELECT username FROM teachers WHERE id=$1', [req.session.teacher_id]);
+        logTeacherAccess(req, req.session.teacher_id, t.rows[0]?.username, 'view');
+      }
+    }
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
     const dow = new Date(today + 'T12:00:00Z').getUTCDay();
     const ws = new Date(today + 'T12:00:00Z'); ws.setUTCDate(ws.getUTCDate() - dow);
