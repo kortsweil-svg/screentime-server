@@ -290,6 +290,32 @@ app.delete('/api/teacher/staff/:id', auth, ownerOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── מחיקת המרחב כולו (בעל החשבון בלבד, עם סיסמה וקוד מוסד לאישור) ───────────
+app.post('/api/teacher/delete-space', auth, ownerOnly, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const t = await client.query('SELECT * FROM teachers WHERE id=$1', [req.session.teacher_id]);
+    const teacher = t.rows[0];
+    if (!teacher) return res.status(404).json({ error: 'החשבון לא נמצא' });
+    if (teacher.password_hash !== hash(String(req.body.password || '')))
+      return res.status(401).json({ error: 'הסיסמה שגויה' });
+    if (String(req.body.confirmCode || '').trim() !== String(teacher.institution_code))
+      return res.status(400).json({ error: 'קוד המוסד לאישור לא תואם' });
+    await client.query('BEGIN');
+    await client.query('DELETE FROM reports_history WHERE student_id IN (SELECT id FROM students WHERE teacher_id=$1)', [teacher.id]);
+    await client.query("DELETE FROM sessions WHERE teacher_id=$1 OR user_id IN (SELECT id FROM students WHERE teacher_id=$1)", [teacher.id]);
+    await client.query('DELETE FROM teacher_staff WHERE teacher_id=$1', [teacher.id]);
+    await client.query('DELETE FROM teacher_access WHERE teacher_id=$1', [teacher.id]);
+    await client.query('DELETE FROM teachers WHERE id=$1', [teacher.id]);   // מוחק גם תלמידים, דיווחים ומצב רוח (CASCADE)
+    await client.query('COMMIT');
+    console.log(`[space] deleted ${teacher.username} (${teacher.institution_code})`);
+    res.json({ ok: true });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
+});
+
 // יומן הכניסות והצפיות בלוח (60 הימים האחרונים, עד 100 רשומות)
 app.get('/api/teacher/access', auth, teacherOnly, async (req, res) => {
   try {
