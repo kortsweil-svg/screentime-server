@@ -83,6 +83,14 @@ async function initDB() {
     );
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NOW();
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS nav_excluded BOOLEAN;
+    CREATE TABLE IF NOT EXISTS teacher_staff (
+      id TEXT PRIMARY KEY,
+      teacher_id TEXT NOT NULL,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      name TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS teacher_access (
       id SERIAL PRIMARY KEY,
       teacher_id TEXT,
@@ -196,7 +204,7 @@ app.post('/api/teacher/register', async (req, res) => {
   const { username, password, name } = req.body;
   if (!username || !password || !name) return res.status(400).json({ error: 'חסרים פרטים' });
   try {
-    const exists = await pool.query('SELECT id FROM teachers WHERE username=$1', [username]);
+    const exists = await pool.query('SELECT id FROM teachers WHERE username=$1 UNION ALL SELECT id FROM teacher_staff WHERE username=$1', [username]);
     if (exists.rows.length) return res.status(400).json({ error: 'שם משתמש תפוס' });
     const id = genId();
     const institutionCode = genCode();
@@ -216,23 +224,69 @@ app.post('/api/teacher/login', async (req, res) => {
   const { username, password } = req.body;
   try {
     const r = await pool.query('SELECT * FROM teachers WHERE username=$1', [username]);
-    const teacher = r.rows[0];
+    let teacher = r.rows[0];
+    // משתמש צוות: נכנס לאותו לוח של המורה שיצר אותו, עם שם משתמש וסיסמה משלו
+    let staff = null;
+    if (!teacher) {
+      const st = await pool.query('SELECT * FROM teacher_staff WHERE username=$1', [username]);
+      staff = st.rows[0] || null;
+      if (staff) {
+        const owner = await pool.query('SELECT * FROM teachers WHERE id=$1', [staff.teacher_id]);
+        if (owner.rows[0]) teacher = { ...owner.rows[0], password_hash: staff.password_hash };
+      }
+    }
     if (!teacher || teacher.password_hash !== hash(password))
       return res.status(401).json({ error: 'שם משתמש או סיסמה שגויים' });
+    const userId = staff ? staff.id : teacher.id;           // החסימה והיומן - לכל משתמש בנפרד
+    const userName = staff ? staff.username : teacher.username;
     // משתמש אחד בכל פעם: אם מישהו כבר מחובר לחשבון הזה - לא נותנים להיכנס
     const active = await pool.query(
       `SELECT 1 FROM sessions WHERE user_id=$1 AND role='teacher'
          AND COALESCE(last_seen, created_at) > NOW() - ($2 || ' minutes')::interval LIMIT 1`,
-      [teacher.id, String(TEACHER_ACTIVE_MIN)]);
+      [userId, String(TEACHER_ACTIVE_MIN)]);
     if (active.rows.length)
       return res.status(409).json({ error: `מישהו כבר מחובר לחשבון הזה ממכשיר אחר. אפשר להיכנס אחרי שיתנתק, או אחרי ${TEACHER_ACTIVE_MIN} דקות בלי שימוש.` });
     // חיבורים ישנים של החשבון (שלא היו פעילים) נמחקים
-    await pool.query("DELETE FROM sessions WHERE user_id=$1 AND role='teacher'", [teacher.id]);
+    await pool.query("DELETE FROM sessions WHERE user_id=$1 AND role='teacher'", [userId]);
     const token = genToken();
     await pool.query('INSERT INTO sessions (token,user_id,role,teacher_id) VALUES ($1,$2,$3,$4)',
-      [token, teacher.id, 'teacher', teacher.id]);
-    logTeacherAccess(req, teacher.id, teacher.username, 'login');
-    res.json({ ok: true, token, teacher: { id: teacher.id, username: teacher.username, name: teacher.name, institutionCode: teacher.institution_code } });
+      [token, userId, 'teacher', teacher.id]);
+    logTeacherAccess(req, teacher.id, userName, 'login');
+    res.json({ ok: true, token, teacher: { id: teacher.id, username: userName, name: staff ? (staff.name || staff.username) : teacher.name,
+      institutionCode: teacher.institution_code, isStaff: !!staff } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── משתמשי צוות (רק בעל החשבון מנהל אותם) ───────────────────────────────────
+function ownerOnly(req, res, next) {
+  if (req.session.role !== 'teacher' || req.session.user_id !== req.session.teacher_id)
+    return res.status(403).json({ error: 'רק בעל החשבון יכול לנהל משתמשי צוות' });
+  next();
+}
+app.get('/api/teacher/staff', auth, ownerOnly, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT id, username, name, created_at FROM teacher_staff WHERE teacher_id=$1 ORDER BY created_at', [req.session.teacher_id]);
+    res.json({ ok: true, staff: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/teacher/staff', auth, ownerOnly, async (req, res) => {
+  try {
+    const name = String(req.body.name || '').trim();
+    const username = String(req.body.username || '').trim();
+    const password = String(req.body.password || '');
+    if (!name || !username || password.length < 4) return res.status(400).json({ error: 'צריך שם, שם משתמש וסיסמה (4 תווים לפחות)' });
+    const taken = await pool.query('SELECT 1 FROM teachers WHERE username=$1 UNION ALL SELECT 1 FROM teacher_staff WHERE username=$1', [username]);
+    if (taken.rows.length) return res.status(400).json({ error: 'שם המשתמש תפוס' });
+    await pool.query('INSERT INTO teacher_staff (id, teacher_id, username, password_hash, name) VALUES ($1,$2,$3,$4,$5)',
+      [genId(), req.session.teacher_id, username, hash(password), name]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/teacher/staff/:id', auth, ownerOnly, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM teacher_staff WHERE id=$1 AND teacher_id=$2', [req.params.id, req.session.teacher_id]);
+    await pool.query("DELETE FROM sessions WHERE user_id=$1 AND role='teacher'", [req.params.id]);   // מנתקים אותו מיד
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -456,7 +510,8 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
       const last = lastViewLog.get(tok) || 0;
       if (Date.now() - last > 30 * 60 * 1000) {
         lastViewLog.set(tok, Date.now());
-        const t = await pool.query('SELECT username FROM teachers WHERE id=$1', [req.session.teacher_id]);
+        const t = await pool.query(
+          `SELECT username FROM teachers WHERE id=$1 UNION ALL SELECT username FROM teacher_staff WHERE id=$1`, [req.session.user_id]);
         logTeacherAccess(req, req.session.teacher_id, t.rows[0]?.username, 'view');
       }
     }
