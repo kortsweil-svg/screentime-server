@@ -833,6 +833,58 @@ app.get('/api/my-history', auth, async (req, res) => {
 
 // ─── דירוג שבועי לפי ימים שעמד ביעד, בתוך קבוצת אותו יעד ───
 // מחזיר לתלמיד רק את המיקום שלו. 404 כשאין דירוג: אין יעד, אין הסכמה, או קבוצה קטנה מ-3.
+// דירוג תלמיד מתחילת תקופה (from=null: מאז ומעולם) ועד אתמול, באותם כללים כמו הדירוג השבועי:
+// בתוך מורה + יעד נוכחי, רק תלמידים עם יום נתונים אחד לפחות, ומשלושה תלמידים ומעלה.
+async function periodRank(studentId, from) {
+  const r = await pool.query(`
+    WITH me AS (
+      SELECT s.teacher_id, r.goal_hours::numeric AS goal_hours
+      FROM students s JOIN reports r ON r.student_id = s.id
+      WHERE s.id = $1 AND r.goal_hours::numeric > 0
+    ),
+    stats AS (
+      SELECT s.id,
+        COUNT(h.student_id) FILTER (WHERE h.day_minutes IS NOT NULL
+          AND h.day_minutes <= COALESCE(NULLIF(h.goal_hours::numeric, 0), me.goal_hours) * 60)::int AS met,
+        COUNT(h.student_id) FILTER (WHERE h.day_minutes IS NOT NULL)::int AS rep
+      FROM me
+      JOIN students s ON s.teacher_id = me.teacher_id AND s.active = TRUE AND s.consent = TRUE
+      JOIN reports r ON r.student_id = s.id AND r.goal_hours::numeric = me.goal_hours
+      LEFT JOIN reports_history h ON h.student_id = s.id
+        AND ($2::date IS NULL OR h.report_date::date >= $2::date)
+        AND h.report_date::date < (NOW() AT TIME ZONE 'Asia/Jerusalem')::date
+      GROUP BY s.id
+    ),
+    ranked AS (
+      SELECT id, met, rep, DENSE_RANK() OVER (ORDER BY met DESC)::int AS rk, COUNT(*) OVER ()::int AS sz
+      FROM stats WHERE rep > 0
+    )
+    SELECT r.*, (SELECT COUNT(*)::int FROM ranked x WHERE x.met = r.met) AS tie,
+           (SELECT goal_hours FROM me) AS goal_hours
+    FROM ranked r WHERE r.id = $1`, [studentId, from]);
+  const row = r.rows[0];
+  if (!row || row.sz < 3) return null;
+  return { rank: row.rk, groupSize: row.sz, daysMet: row.met, daysReported: row.rep,
+           sharedWith: Math.max(0, row.tie - 1), goalHours: Number(row.goal_hours) };
+}
+
+// דירוג החודש ומאז ומעולם (לאפליקציה 6.73+). null = אין דירוג לתקופה.
+app.get('/api/goal-rank-all', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+    const d = new Date(today + 'T12:00:00Z');
+    const weekStart = new Date(d.getTime() - d.getUTCDay() * 86400000).toISOString().slice(0, 10);
+    const monthStart = today.slice(0, 8) + '01';
+    const [week, month, ever] = await Promise.all([
+      periodRank(req.session.user_id, weekStart),
+      periodRank(req.session.user_id, monthStart),
+      periodRank(req.session.user_id, null),
+    ]);
+    res.json({ week, month, ever });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/goal-rank', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   try {
