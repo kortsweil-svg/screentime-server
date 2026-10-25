@@ -546,7 +546,7 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
     const ws = new Date(today + 'T12:00:00Z'); ws.setUTCDate(ws.getUTCDate() - dow);
     const weekStart = ws.toISOString().slice(0, 10);
     const st = await pool.query(`
-      SELECT s.id, s.name, s.class_name, s.consent, s.active,
+      SELECT s.id, s.name, s.class_name, s.consent, s.active, (s.fcm_token IS NOT NULL) AS has_push,
              r.goal_hours, r.platform, r.synced_at, r.app_version, r.nav_excluded,
              g.days_met, g.days_reported, g.goal_rank, g.group_size
       FROM students s
@@ -582,6 +582,8 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
         platform: s.platform || null,
         lastSync: s.synced_at || null,
         appVersion: s.app_version || null,
+        // פוש: יש מזהה רק אם התלמיד אישר התראות (בלי אישור האפליקציה לא נרשמת)
+        hasPush: !!s.has_push,
         // ניכוי ניווט ותפילה: אנדרואיד 6.68+ אוטומטי; אייפון - רק מה שהאפליקציה דיווחה (6.70+)
         navExcluded: s.platform === 'android'
           ? (verNum(s.app_version) >= 6.68 ? true : false)
