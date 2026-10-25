@@ -814,17 +814,18 @@ app.get('/api/my-history', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   try {
     const r = await pool.query(`
-      SELECT report_date, day_minutes, synced_at
+      SELECT report_date, day_minutes, synced_at, goal_hours
       FROM reports_history
       WHERE student_id = $1 AND day_minutes IS NOT NULL
-      ORDER BY report_date DESC LIMIT 60
-    `, [req.session.user_id]);
+      ORDER BY report_date DESC LIMIT $2
+    `, [req.session.user_id, Math.min(400, Math.max(1, parseInt(req.query.limit) || 60))]);
     res.json({
       days: r.rows.map(x => ({
         date: typeof x.report_date === 'string'
           ? x.report_date
           : new Date(x.report_date).toISOString().split('T')[0],
         minutes: x.day_minutes,
+        goalHours: x.goal_hours != null ? Number(x.goal_hours) : null,   // לטבלת החודש באפליקציה
       })),
       lastSync: r.rows[0]?.synced_at || null,
     });
