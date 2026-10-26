@@ -91,6 +91,18 @@ async function initDB() {
       name TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS support_messages (
+      id SERIAL PRIMARY KEY,
+      student_id TEXT,
+      teacher_id TEXT,
+      text TEXT,
+      platform TEXT,
+      app_version TEXT,
+      os_version TEXT,
+      diag TEXT,
+      handled BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS teacher_access (
       id SERIAL PRIMARY KEY,
       teacher_id TEXT,
@@ -306,6 +318,7 @@ app.post('/api/teacher/delete-space', auth, ownerOnly, async (req, res) => {
     await client.query("DELETE FROM sessions WHERE teacher_id=$1 OR user_id IN (SELECT id FROM students WHERE teacher_id=$1)", [teacher.id]);
     await client.query('DELETE FROM teacher_staff WHERE teacher_id=$1', [teacher.id]);
     await client.query('DELETE FROM teacher_access WHERE teacher_id=$1', [teacher.id]);
+    await client.query('DELETE FROM support_messages WHERE teacher_id=$1', [teacher.id]);
     await client.query('DELETE FROM teachers WHERE id=$1', [teacher.id]);   // מוחק גם תלמידים, דיווחים ומצב רוח (CASCADE)
     await client.query('COMMIT');
     console.log(`[space] deleted ${teacher.username} (${teacher.institution_code})`);
@@ -314,6 +327,47 @@ app.post('/api/teacher/delete-space', auth, ownerOnly, async (req, res) => {
     try { await client.query('ROLLBACK'); } catch (_) {}
     res.status(500).json({ error: e.message });
   } finally { client.release(); }
+});
+
+// ─── פניות תמיכה מהאפליקציה ───────────────────────────────────────────────────
+app.post('/api/support', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const text = String(req.body.text || '').trim().slice(0, 2000);
+    if (text.length < 3) return res.status(400).json({ error: 'חסר תוכן' });
+    const recent = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM support_messages WHERE student_id=$1 AND created_at > NOW() - INTERVAL '1 day'`,
+      [req.session.user_id]);
+    if (recent.rows[0].n >= 10) return res.status(429).json({ error: 'נשלחו יותר מדי פניות היום' });
+    const st = await pool.query('SELECT teacher_id FROM students WHERE id=$1', [req.session.user_id]);
+    const diag = req.body.diag ? JSON.stringify(req.body.diag).slice(0, 30000) : null;
+    await pool.query(
+      `INSERT INTO support_messages (student_id, teacher_id, text, platform, app_version, os_version, diag)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [req.session.user_id, st.rows[0]?.teacher_id || null, text,
+       String(req.body.platform || '').slice(0, 20), String(req.body.appVersion || '').slice(0, 20),
+       String(req.body.osVersion || '').slice(0, 20), diag]);
+    console.log(`[support] new message from ${req.session.user_id}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/teacher/support', auth, teacherOnly, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT m.id, m.text, m.platform, m.app_version, m.os_version, m.diag, m.handled, m.created_at,
+             s.name, s.class_name
+      FROM support_messages m LEFT JOIN students s ON s.id = m.student_id
+      WHERE m.teacher_id = $1
+      ORDER BY m.handled ASC, m.created_at DESC LIMIT 100`, [req.session.teacher_id]);
+    res.json({ ok: true, messages: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/teacher/support/:id/handled', auth, teacherOnly, async (req, res) => {
+  try {
+    await pool.query('UPDATE support_messages SET handled = $1 WHERE id = $2 AND teacher_id = $3',
+      [req.body.handled !== false, req.params.id, req.session.teacher_id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // יומן הכניסות והצפיות בלוח (60 הימים האחרונים, עד 100 רשומות)
