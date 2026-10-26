@@ -606,7 +606,7 @@ app.post('/api/student/login', async (req, res) => {
 app.get('/api/students', auth, teacherOnly, async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT s.id, s.name, s.class_name, s.consent, s.active,
+      SELECT s.id, s.name, s.class_name, s.consent, s.active, s.username,
              r.platform, r.synced_at, r.goal_hours, r.app_version
       FROM students s
       LEFT JOIN reports r ON s.id = r.student_id
@@ -700,6 +700,20 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
     console.error('[teacher/overview]', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// איפוס סיסמה של תלמיד ע"י המורה: סיסמה זמנית של 6 ספרות. הטלפון שכבר מחובר
+// נשאר מחובר (המדידה לא נפסקת) - הסיסמה החדשה נדרשת רק בכניסה הבאה.
+app.post('/api/students/:id/reset-password', auth, teacherOnly, async (req, res) => {
+  try {
+    const st = await pool.query('SELECT id, username, name FROM students WHERE id=$1 AND teacher_id=$2',
+      [req.params.id, req.session.teacher_id]);
+    if (!st.rows.length) return res.status(404).json({ error: 'תלמיד לא נמצא' });
+    const password = String(Math.floor(100000 + Math.random() * 900000));
+    await pool.query('UPDATE students SET password_hash=$1 WHERE id=$2', [hash(password), req.params.id]);
+    console.log(`[reset] student ${req.params.id}`);
+    res.json({ ok: true, username: st.rows[0].username, password });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // עריכת פרטי תלמיד ע"י המורה/המנהל: שם וכיתה
