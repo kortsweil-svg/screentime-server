@@ -92,6 +92,8 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     );
     ALTER TABLE teachers ADD COLUMN IF NOT EXISTS support_phone TEXT;
+    -- יום שהמורה תיקן בלוח: הטלפון לא דורס אותו יותר
+    ALTER TABLE reports_history ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS support_messages (
       id SERIAL PRIMARY KEY,
       student_id TEXT,
@@ -376,6 +378,26 @@ app.post('/api/teacher/support-phone', auth, ownerOnly, async (req, res) => {
     res.json({ ok: true, phone: phone || '' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// תיקון יום של תלמיד בלוח המורה (minutes=null: "אין נתון"). היום ננעל: הטלפון לא דורס אותו.
+app.post('/api/teacher/day', auth, teacherOnly, async (req, res) => {
+  try {
+    const { studentId, date } = req.body;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || ''))) return res.status(400).json({ error: 'תאריך לא תקין' });
+    const own = await pool.query('SELECT 1 FROM students WHERE id=$1 AND teacher_id=$2', [studentId, req.session.teacher_id]);
+    if (!own.rows.length) return res.status(404).json({ error: 'תלמיד לא נמצא' });
+    let minutes = req.body.minutes;
+    if (minutes === null || minutes === '' || minutes === undefined) minutes = null;
+    else { minutes = parseInt(minutes); if (!Number.isFinite(minutes) || minutes < 0 || minutes > 1440) return res.status(400).json({ error: 'זמן לא תקין' }); }
+    await pool.query(`
+      INSERT INTO reports_history (id, student_id, platform, report_date, synced_at, day_minutes, locked)
+      VALUES ($1,$2,'manual',$3,$4,$5,TRUE)
+      ON CONFLICT (student_id, report_date) DO UPDATE SET day_minutes = EXCLUDED.day_minutes, locked = TRUE
+    `, [genId(), studentId, date, new Date().toISOString(), minutes]);
+    console.log(`[day-fix] ${studentId} ${date} -> ${minutes}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/teacher/support', auth, teacherOnly, async (req, res) => {
   try {
     const r = await pool.query(`
@@ -802,7 +824,8 @@ app.post('/api/report', auth, async (req, res) => {
       ON CONFLICT (student_id, report_date) DO UPDATE SET
         platform=EXCLUDED.platform, synced_at=EXCLUDED.synced_at,
         goal_hours=CASE WHEN $8 THEN EXCLUDED.goal_hours ELSE reports_history.goal_hours END,
-        day_minutes=CASE WHEN EXCLUDED.day_minutes IS NOT NULL THEN EXCLUDED.day_minutes ELSE reports_history.day_minutes END
+        day_minutes=CASE WHEN reports_history.locked THEN reports_history.day_minutes
+                         WHEN EXCLUDED.day_minutes IS NOT NULL THEN EXCLUDED.day_minutes ELSE reports_history.day_minutes END
     `, [genId(), req.session.user_id, platform || 'unknown', today,
         syncedAt || new Date().toISOString(), goalHours ?? null, dayMinutes ?? null, hasGoal]);
 
@@ -823,7 +846,8 @@ app.post('/api/report', auth, async (req, res) => {
           INSERT INTO reports_history (id, student_id, platform, report_date, synced_at, goal_hours, day_minutes)
           VALUES ($1,$2,$3,$4,$5,$6,$7)
           ON CONFLICT (student_id, report_date) DO UPDATE SET
-            day_minutes = GREATEST(COALESCE(reports_history.day_minutes, 0), EXCLUDED.day_minutes),
+            day_minutes = CASE WHEN reports_history.locked THEN reports_history.day_minutes
+                               ELSE GREATEST(COALESCE(reports_history.day_minutes, 0), EXCLUDED.day_minutes) END,
             goal_hours = COALESCE(reports_history.goal_hours, EXCLUDED.goal_hours)
         `, [genId(), req.session.user_id, platform || 'unknown', date,
             syncedAt || new Date().toISOString(), goalHours ?? null, minutes]);
@@ -873,7 +897,8 @@ app.post('/api/ios-day', auth, async (req, res) => {
       VALUES ($1,$2,'ios',$3,$4,$5,$6)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
         -- תוצאת השחר (final) קובעת; תוצאת לילה רק מעלה
-        day_minutes = CASE WHEN $7 THEN EXCLUDED.day_minutes
+        day_minutes = CASE WHEN reports_history.locked THEN reports_history.day_minutes
+                           WHEN $7 THEN EXCLUDED.day_minutes
                            ELSE GREATEST(COALESCE(reports_history.day_minutes, 0), EXCLUDED.day_minutes) END,
         goal_hours = COALESCE(EXCLUDED.goal_hours, reports_history.goal_hours)
     `, [genId(), req.session.user_id, date, new Date().toISOString(), goalHours, stored, !!req.body.final]);
@@ -893,11 +918,12 @@ app.get('/api/my-history', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   try {
     const r = await pool.query(`
-      SELECT report_date, day_minutes, synced_at, goal_hours
+      SELECT report_date, day_minutes, synced_at, goal_hours, locked
       FROM reports_history
-      WHERE student_id = $1 AND day_minutes IS NOT NULL
+      WHERE student_id = $1 AND (day_minutes IS NOT NULL OR ($3 AND locked = TRUE))
       ORDER BY report_date DESC LIMIT $2
-    `, [req.session.user_id, Math.min(400, Math.max(1, parseInt(req.query.limit) || 60))]);
+    `, [req.session.user_id, Math.min(400, Math.max(1, parseInt(req.query.limit) || 60)),
+        req.query.corrections === '1']);   // גרסאות ישנות לא מקבלות שורות בלי דקות
     res.json({
       days: r.rows.map(x => ({
         date: typeof x.report_date === 'string'
@@ -905,6 +931,7 @@ app.get('/api/my-history', auth, async (req, res) => {
           : new Date(x.report_date).toISOString().split('T')[0],
         minutes: x.day_minutes,
         goalHours: x.goal_hours != null ? Number(x.goal_hours) : null,   // לטבלת החודש באפליקציה
+        corrected: !!x.locked,   // יום שהמורה תיקן - האפליקציה מעדיפה אותו על מה ששמור בטלפון
       })),
       lastSync: r.rows[0]?.synced_at || null,
     });
