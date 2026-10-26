@@ -989,6 +989,93 @@ async function periodRank(studentId, from) {
            sharedWith: Math.max(0, row.tie - 1), goalHours: Number(row.goal_hours) };
 }
 
+// ─── הישגים מחושבים בשרת: רצף, כוכבים שבועיים וגביעים חודשיים ────────────────
+// אותם כללים כמו בלוח המורה, ומאותם נתונים (כולל תיקוני המורה). כך כל תיקון בשרת
+// מגיע מיד לאפליקציה, בלי עדכון גרסה.
+//   יום ביעד: דקות <= יעד באותו יום (או היעד הנוכחי).
+//   כוכב: שבוע ראשון-שבת שהסתיים, לפחות 4 ימים מדודים ו-5 ימים ביעד.
+//   סוג כוכב לפי היעד: 3ש' זהב, 4ש' כסף, 5ש' ארד, 6ש'+ רגיל.
+//   גביע: 4 כוכבי מועדון (זהב/כסף/ארד) באותו חודש. ארבעה מאותו סוג = גביע מאותו סוג, אחרת משולב.
+//   רצף: ימים רצופים ביעד, מאתמול אחורה. יום בלי נתון לא שובר, חריגה שוברת.
+function isoAdd(d, n) {
+  const t = new Date(d + 'T12:00:00Z'); t.setUTCDate(t.getUTCDate() + n); return t.toISOString().slice(0, 10);
+}
+function starTypeFor(g) { return g === 3 ? 'gold' : g === 4 ? 'silver' : g === 5 ? 'bronze' : g >= 6 ? 'basic' : null; }
+function computeAchievements(rows, currentGoal, today) {
+  const days = {};
+  for (const r of rows) if (r.minutes != null) days[r.date] = { minutes: r.minutes, goal: r.goal || currentGoal || null };
+  const met = d => d && d.goal ? d.minutes <= d.goal * 60 : null;
+
+  // רצף
+  let streak = 0;
+  for (let i = 1; i <= 400; i++) {
+    const d = days[isoAdd(today, -i)];
+    const m = met(d);
+    if (m === null) continue;
+    if (m) streak++; else break;
+  }
+
+  // כוכבים (השנה הקלנדרית)
+  const year = today.slice(0, 4);
+  let sat = year + '-01-01';
+  while (new Date(sat + 'T12:00:00Z').getUTCDay() !== 6) sat = isoAdd(sat, 1);
+  const stars = [];
+  for (; sat < today; sat = isoAdd(sat, 7)) {
+    let measured = 0, metN = 0, goal = null;
+    for (let i = 6; i >= 0; i--) {
+      const d = days[isoAdd(sat, -i)];
+      if (!d || !d.goal) continue;
+      goal = d.goal; measured++;
+      if (d.minutes <= d.goal * 60) metN++;
+    }
+    const type = starTypeFor(goal);
+    if (type && measured >= 4 && metN >= 5) stars.push({ weekSaturday: sat, type });
+  }
+
+  // גביעים
+  const trophies = [];
+  for (const m of [...new Set(stars.map(x => x.weekSaturday.slice(0, 7)))].sort()) {
+    const club = stars.filter(x => x.weekSaturday.startsWith(m) && x.type !== 'basic');
+    if (club.length >= 4) {
+      const t = ['gold', 'silver', 'bronze'].find(c => club.every(x => x.type === c)) || 'mixed';
+      trophies.push({ month: m, type: t });
+    }
+  }
+
+  // השבוע הנוכחי (ראשון עד אתמול)
+  const dow = new Date(today + 'T12:00:00Z').getUTCDay();
+  let weekMet = 0, weekMeasured = 0;
+  for (let i = dow; i >= 1; i--) {
+    const m = met(days[isoAdd(today, -i)]);
+    if (m === null) continue;
+    weekMeasured++; if (m) weekMet++;
+  }
+
+  const curMonth = today.slice(0, 7);
+  return {
+    streak, stars, trophies,
+    monthStars: stars.filter(x => x.weekSaturday.startsWith(curMonth)),
+    yearStars: stars.length,
+    week: { met: weekMet, measured: weekMeasured },
+  };
+}
+
+app.get('/api/my-achievements', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+    const g = await pool.query('SELECT goal_hours FROM reports WHERE student_id=$1', [req.session.user_id]);
+    const h = await pool.query(`
+      SELECT report_date::date::text AS date, day_minutes AS minutes, goal_hours AS goal
+      FROM reports_history
+      WHERE student_id = $1 AND day_minutes IS NOT NULL AND report_date::date >= ($2::date - INTERVAL '400 days')
+    `, [req.session.user_id, today]);
+    const rows = h.rows.map(r => ({ date: r.date, minutes: Number(r.minutes), goal: r.goal != null ? Number(r.goal) : null }));
+    const goal = g.rows[0]?.goal_hours != null ? Number(g.rows[0].goal_hours) : null;
+    res.json({ ok: true, today, ...computeAchievements(rows, goal, today) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // דירוג החודש ומאז ומעולם (לאפליקציה 6.73+). null = אין דירוג לתקופה.
 app.get('/api/goal-rank-all', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
