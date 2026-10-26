@@ -91,6 +91,7 @@ async function initDB() {
       name TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS support_phone TEXT;
     CREATE TABLE IF NOT EXISTS support_messages (
       id SERIAL PRIMARY KEY,
       student_id TEXT,
@@ -348,7 +349,31 @@ app.post('/api/support', auth, async (req, res) => {
        String(req.body.platform || '').slice(0, 20), String(req.body.appVersion || '').slice(0, 20),
        String(req.body.osVersion || '').slice(0, 20), diag]);
     console.log(`[support] new message from ${req.session.user_id}`);
-    res.json({ ok: true });
+    // מספר וואטסאפ לפניות (אם המורה הגדיר) - האפליקציה מציעה לשלוח אליו צילום מסך
+    const ph = await pool.query('SELECT support_phone FROM teachers WHERE id=$1', [st.rows[0]?.teacher_id || null]);
+    res.json({ ok: true, supportPhone: ph.rows[0]?.support_phone || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// מספר וואטסאפ לפניות תמיכה (נשמר במספר בינלאומי: 9725XXXXXXXX)
+function normPhone(p) {
+  let d = String(p || '').replace(/[^0-9]/g, '');
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.startsWith('0')) d = '972' + d.slice(1);
+  return d.length >= 11 && d.length <= 15 ? d : null;
+}
+app.get('/api/teacher/support-phone', auth, teacherOnly, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT support_phone FROM teachers WHERE id=$1', [req.session.teacher_id]);
+    res.json({ ok: true, phone: r.rows[0]?.support_phone || '' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/teacher/support-phone', auth, ownerOnly, async (req, res) => {
+  try {
+    const raw = String(req.body.phone || '').trim();
+    const phone = raw ? normPhone(raw) : null;
+    if (raw && !phone) return res.status(400).json({ error: 'מספר לא תקין' });
+    await pool.query('UPDATE teachers SET support_phone=$1 WHERE id=$2', [phone, req.session.teacher_id]);
+    res.json({ ok: true, phone: phone || '' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/api/teacher/support', auth, teacherOnly, async (req, res) => {
