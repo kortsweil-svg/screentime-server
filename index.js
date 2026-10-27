@@ -176,6 +176,18 @@ async function initDB() {
   } catch (e) {
     console.log('[goal_rank view] error:', e.message);
   }
+  // אבטחה: RLS על כל הטבלאות, כדי שלא תהיה גישה אליהן דרך ה-API הציבורי של Supabase
+  // (anon / authenticated). השרת מתחבר כבעלים של הטבלאות, ולכן לא מושפע.
+  try {
+    await pool.query(`
+      DO $$ DECLARE r record; BEGIN
+        FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND NOT rowsecurity LOOP
+          EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', r.tablename);
+        END LOOP;
+      END $$;
+    `);
+    await pool.query(`REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated`).catch(() => {});
+  } catch (e) { console.log('[rls] failed', e.message); }
   console.log('DB ready');
 }
 
