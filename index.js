@@ -1007,11 +1007,20 @@ async function periodRank(studentId, from) {
 //   יום ביעד: דקות <= יעד באותו יום (או היעד הנוכחי).
 //   כוכב: שבוע ראשון-שבת שהסתיים, לפחות 4 ימים מדודים ו-5 ימים ביעד.
 //   סוג כוכב לפי היעד: 3ש' זהב, 4ש' כסף, 5ש' ארד, 6ש'+ רגיל.
-//   גביע: 4 כוכבי מועדון (זהב/כסף/ארד) באותו חודש. ארבעה מאותו סוג = גביע מאותו סוג, אחרת משולב.
+//   גביע: כוכב מועדון (זהב/כסף/ארד) בכל שבועות החודש: בחודש עם 4 שבתות - 4 כוכבים,
+//   בחודש עם 5 שבתות - 5. כולם מאותו סוג = גביע מאותו סוג, אחרת משולב.
 //   רצף: ימים רצופים ביעד, מאתמול אחורה. יום בלי נתון לא שובר, חריגה שוברת.
 function isoAdd(d, n) {
   const t = new Date(d + 'T12:00:00Z'); t.setUTCDate(t.getUTCDate() + n); return t.toISOString().slice(0, 10);
 }
+function saturdaysIn(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  let n = 0;
+  for (let d = 1; d <= new Date(Date.UTC(y, m, 0)).getUTCDate(); d++)
+    if (new Date(Date.UTC(y, m - 1, d)).getUTCDay() === 6) n++;
+  return n;
+}
+function trophyNeed(ym) { return saturdaysIn(ym); }   // כוכב בכל שבוע של החודש
 function starTypeFor(g) { return g === 3 ? 'gold' : g === 4 ? 'silver' : g === 5 ? 'bronze' : g >= 6 ? 'basic' : null; }
 function computeAchievements(rows, currentGoal, today) {
   const days = {};
@@ -1048,7 +1057,7 @@ function computeAchievements(rows, currentGoal, today) {
   const trophies = [];
   for (const m of [...new Set(stars.map(x => x.weekSaturday.slice(0, 7)))].sort()) {
     const club = stars.filter(x => x.weekSaturday.startsWith(m) && x.type !== 'basic');
-    if (club.length >= 4) {
+    if (club.length >= trophyNeed(m)) {
       const t = ['gold', 'silver', 'bronze'].find(c => club.every(x => x.type === c)) || 'mixed';
       trophies.push({ month: m, type: t });
     }
@@ -1067,6 +1076,8 @@ function computeAchievements(rows, currentGoal, today) {
   return {
     streak, stars, trophies,
     monthStars: stars.filter(x => x.weekSaturday.startsWith(curMonth)),
+    monthWeeks: saturdaysIn(curMonth),        // כמה משבצות כוכב יש החודש (4 או 5)
+    trophyNeed: trophyNeed(curMonth),         // כמה כוכבים צריך לגביע החודש
     yearStars: stars.length,
     week: { met: weekMet, measured: weekMeasured },
   };
