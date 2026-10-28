@@ -674,10 +674,10 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
       JOIN students s ON s.id = h.student_id
       WHERE s.teacher_id = $1
         AND s.consent = TRUE
-        AND h.report_date::date >= (date_trunc('year', $2::date)::date - 7)
+        AND h.report_date::date >= ($2::date - 7)   -- מתחילת שנת הלימודים
         AND h.day_minutes IS NOT NULL
       ORDER BY h.report_date
-    `, [req.session.teacher_id, today]);
+    `, [req.session.teacher_id, schoolYear(today).start]);
     const byStudent = {};
     for (const h of hist.rows) {
       (byStudent[h.student_id] = byStudent[h.student_id] || []).push({
@@ -686,8 +686,9 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
         goalHours: h.goal_hours !== null ? parseFloat(h.goal_hours) : null,
       });
     }
+    const sy = schoolYear(today);
     res.json({
-      today, weekStart,
+      today, weekStart, yearStart: sy.start, yearEnd: sy.end,
       students: st.rows.map(s => ({
         id: s.id, name: s.name, className: s.class_name,
         consent: s.consent, active: s.active,
@@ -1007,11 +1008,28 @@ async function periodRank(studentId, from) {
 //   יום ביעד: דקות <= יעד באותו יום (או היעד הנוכחי).
 //   כוכב: שבוע ראשון-שבת שהסתיים, לפחות 4 ימים מדודים ו-5 ימים ביעד.
 //   סוג כוכב לפי היעד: 3ש' זהב, 4ש' כסף, 5ש' ארד, 6ש'+ רגיל.
+//   שנה: 1.9 עד 31.8.
 //   גביע: כוכב מועדון (זהב/כסף/ארד) בכל שבועות החודש: בחודש עם 4 שבתות - 4 כוכבים,
 //   בחודש עם 5 שבתות - 5. כולם מאותו סוג = גביע מאותו סוג, אחרת משולב.
 //   רצף: ימים רצופים ביעד, מאתמול אחורה. יום בלי נתון לא שובר, חריגה שוברת.
 function isoAdd(d, n) {
   const t = new Date(d + 'T12:00:00Z'); t.setUTCDate(t.getUTCDate() + n); return t.toISOString().slice(0, 10);
+}
+// שנת ההישגים: 1 בספטמבר עד 31 באוגוסט. ב-1 בספטמבר הכוכבים והגביעים מתאפסים.
+function schoolYear(today) {
+  const y = +today.slice(0, 4), md = today.slice(5);
+  const startY = md >= '09-01' ? y : y - 1;
+  return { start: `${startY}-09-01`, end: `${startY + 1}-08-31` };
+}
+// כמה שבתות יש בחודש בתוך השנה (4 או 5; בספטמבר ובאוגוסט רק מה שבתוך השנה)
+function saturdaysInWindow(ym, start, end) {
+  const [y, m] = ym.split('-').map(Number);
+  let n = 0;
+  for (let d = 1; d <= new Date(Date.UTC(y, m, 0)).getUTCDate(); d++) {
+    const iso = `${ym}-${String(d).padStart(2, '0')}`;
+    if (iso >= start && iso <= end && new Date(Date.UTC(y, m - 1, d)).getUTCDay() === 6) n++;
+  }
+  return n;
 }
 function saturdaysIn(ym) {
   const [y, m] = ym.split('-').map(Number);
@@ -1036,15 +1054,17 @@ function computeAchievements(rows, currentGoal, today) {
     if (m) streak++; else break;
   }
 
-  // כוכבים (השנה הקלנדרית)
-  const year = today.slice(0, 4);
-  let sat = year + '-01-01';
+  // כוכבים: השנה 1.9 - 31.8. שבוע נכלל אם השבת שלו בתוך השנה, ונספרים רק ימים שבתוכה.
+  const { start: yStart, end: yEnd } = schoolYear(today);
+  let sat = yStart;
   while (new Date(sat + 'T12:00:00Z').getUTCDay() !== 6) sat = isoAdd(sat, 1);
   const stars = [];
-  for (; sat < today; sat = isoAdd(sat, 7)) {
+  for (; sat < today && sat <= yEnd; sat = isoAdd(sat, 7)) {
     let measured = 0, metN = 0, goal = null;
     for (let i = 6; i >= 0; i--) {
-      const d = days[isoAdd(sat, -i)];
+      const iso = isoAdd(sat, -i);
+      if (iso < yStart || iso > yEnd) continue;
+      const d = days[iso];
       if (!d || !d.goal) continue;
       goal = d.goal; measured++;
       if (d.minutes <= d.goal * 60) metN++;
@@ -1057,7 +1077,7 @@ function computeAchievements(rows, currentGoal, today) {
   const trophies = [];
   for (const m of [...new Set(stars.map(x => x.weekSaturday.slice(0, 7)))].sort()) {
     const club = stars.filter(x => x.weekSaturday.startsWith(m) && x.type !== 'basic');
-    if (club.length >= trophyNeed(m)) {
+    if (club.length >= saturdaysInWindow(m, yStart, yEnd)) {   // כוכב בכל שבוע של החודש
       const t = ['gold', 'silver', 'bronze'].find(c => club.every(x => x.type === c)) || 'mixed';
       trophies.push({ month: m, type: t });
     }
@@ -1076,8 +1096,9 @@ function computeAchievements(rows, currentGoal, today) {
   return {
     streak, stars, trophies,
     monthStars: stars.filter(x => x.weekSaturday.startsWith(curMonth)),
-    monthWeeks: saturdaysIn(curMonth),        // כמה משבצות כוכב יש החודש (4 או 5)
-    trophyNeed: trophyNeed(curMonth),         // כמה כוכבים צריך לגביע החודש
+    monthWeeks: saturdaysInWindow(curMonth, yStart, yEnd) || 4,   // משבצות כוכב החודש (4 או 5)
+    trophyNeed: saturdaysInWindow(curMonth, yStart, yEnd),         // כוכבים לגביע החודש
+    schoolYear: { start: yStart, end: yEnd },
     yearStars: stars.length,
     week: { met: weekMet, measured: weekMeasured },
   };
@@ -1091,7 +1112,7 @@ app.get('/api/my-achievements', auth, async (req, res) => {
     const h = await pool.query(`
       SELECT report_date::date::text AS date, day_minutes AS minutes, goal_hours AS goal
       FROM reports_history
-      WHERE student_id = $1 AND day_minutes IS NOT NULL AND report_date::date >= ($2::date - INTERVAL '400 days')
+      WHERE student_id = $1 AND day_minutes IS NOT NULL AND report_date::date >= ($2::date - INTERVAL '420 days')
     `, [req.session.user_id, today]);
     const rows = h.rows.map(r => ({ date: r.date, minutes: Number(r.minutes), goal: r.goal != null ? Number(r.goal) : null }));
     const goal = g.rows[0]?.goal_hours != null ? Number(g.rows[0].goal_hours) : null;
