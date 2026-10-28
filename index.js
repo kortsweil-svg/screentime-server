@@ -1040,7 +1040,7 @@ function saturdaysIn(ym) {
 }
 function trophyNeed(ym) { return saturdaysIn(ym); }   // כוכב בכל שבוע של החודש
 function starTypeFor(g) { return g === 3 ? 'gold' : g === 4 ? 'silver' : g === 5 ? 'bronze' : g >= 6 ? 'basic' : null; }
-function computeAchievements(rows, currentGoal, today) {
+function computeAchievements(rows, currentGoal, today, yearWindow) {
   const days = {};
   for (const r of rows) if (r.minutes != null) days[r.date] = { minutes: r.minutes, goal: r.goal || currentGoal || null };
   const met = d => d && d.goal ? d.minutes <= d.goal * 60 : null;
@@ -1055,7 +1055,7 @@ function computeAchievements(rows, currentGoal, today) {
   }
 
   // כוכבים: השנה 1.9 - 31.8. שבוע נכלל אם השבת שלו בתוך השנה, ונספרים רק ימים שבתוכה.
-  const { start: yStart, end: yEnd } = schoolYear(today);
+  const { start: yStart, end: yEnd } = yearWindow || schoolYear(today);
   let sat = yStart;
   while (new Date(sat + 'T12:00:00Z').getUTCDay() !== 6) sat = isoAdd(sat, 1);
   const stars = [];
@@ -1103,6 +1103,50 @@ function computeAchievements(rows, currentGoal, today) {
     week: { met: weekMet, measured: weekMeasured },
   };
 }
+
+// שם השנה העברית של שנת ההישגים: ספטמבר 2026 - אוגוסט 2027 = תשפ"ז
+function hebrewYearLabel(startY) {
+  let n = (startY + 3761) % 1000;               // 5787 -> 787
+  const H = [[400,'ת'],[300,'ש'],[200,'ר'],[100,'ק'],[90,'צ'],[80,'פ'],[70,'ע'],[60,'ס'],[50,'נ'],[40,'מ'],[30,'ל'],[20,'כ'],[10,'י'],[9,'ט'],[8,'ח'],[7,'ז'],[6,'ו'],[5,'ה'],[4,'ד'],[3,'ג'],[2,'ב'],[1,'א']];
+  let out = '';
+  while (n > 0) {
+    if (n === 15) { out += 'טו'; break; }
+    if (n === 16) { out += 'טז'; break; }
+    const [v, ch] = H.find(([v]) => v <= n);
+    out += ch; n -= v;
+  }
+  return out.length > 1 ? out.slice(0, -1) + '"' + out.slice(-1) : out + "'";
+}
+
+// היסטוריית הישגים לפי שנים (1.9 - 31.8): כמה כוכבים וגביעים בכל שנה. מחושב מהנתונים
+// עצמם, כך שכלום לא הולך לאיבוד, וכל תיקון או שינוי כלל חל גם על שנים קודמות.
+app.get('/api/my-achievements-history', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+    const g = await pool.query('SELECT goal_hours FROM reports WHERE student_id=$1', [req.session.user_id]);
+    const h = await pool.query(`
+      SELECT report_date::date::text AS date, day_minutes AS minutes, goal_hours AS goal
+      FROM reports_history WHERE student_id = $1 AND day_minutes IS NOT NULL ORDER BY report_date`, [req.session.user_id]);
+    const rows = h.rows.map(r => ({ date: r.date, minutes: Number(r.minutes), goal: r.goal != null ? Number(r.goal) : null }));
+    const goal = g.rows[0]?.goal_hours != null ? Number(g.rows[0].goal_hours) : null;
+    if (!rows.length) return res.json({ ok: true, years: [] });
+    const firstStart = +schoolYear(rows[0].date).start.slice(0, 4);
+    const curStart = +schoolYear(today).start.slice(0, 4);
+    const years = [];
+    for (let y = curStart; y >= firstStart; y--) {
+      const win = { start: `${y}-09-01`, end: `${y + 1}-08-31` };
+      const a = computeAchievements(rows, goal, today, win);
+      const byType = { gold: 0, silver: 0, bronze: 0, basic: 0 };
+      for (const st of a.stars) byType[st.type]++;
+      years.push({
+        label: hebrewYearLabel(y), from: win.start, to: win.end, current: y === curStart,
+        stars: a.stars.length, starsByType: byType, trophies: a.trophies,
+      });
+    }
+    res.json({ ok: true, years });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get('/api/my-achievements', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
