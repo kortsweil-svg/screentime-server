@@ -607,9 +607,12 @@ app.post('/api/student/login', async (req, res) => {
     const token = genToken();
     await pool.query('INSERT INTO sessions (token,user_id,role,teacher_id) VALUES ($1,$2,$3,$4)',
       [token, student.id, 'student', student.teacher_id]);
+    // היעד השמור: בהתקנה מחדש האפליקציה משחזרת אותו, במקום לבקש לבחור שוב
+    const g = await pool.query('SELECT goal_hours FROM reports WHERE student_id=$1', [student.id]);
+    const goalHours = g.rows[0]?.goal_hours != null ? Number(g.rows[0].goal_hours) : null;
     res.json({
       ok: true, token,
-      student: { id: student.id, name: student.name, className: student.class_name, teacherName: student.teacher_name, platform: 'android', consent: student.consent }
+      student: { id: student.id, name: student.name, className: student.class_name, teacherName: student.teacher_name, platform: 'android', consent: student.consent, goalHours }
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -827,7 +830,8 @@ app.post('/api/report', auth, async (req, res) => {
   // iOS 6.70+: האם התלמיד הפעיל (ואימת) את ניכוי הניווט והתפילה
   const hasNav = typeof req.body.navExcluded === 'boolean';
   // יעד נשמר רק כשהדיווח שלח אותו. גרסה ישנה מאוד בלי השדה לא תמחק יעד קיים.
-  const hasGoal = Object.prototype.hasOwnProperty.call(req.body, 'goalHours');
+  // יעד 0 (אפליקציה שהותקנה מחדש ועוד לא שחזרה את היעד) לא מוחק יעד קיים
+  const hasGoal = Object.prototype.hasOwnProperty.call(req.body, 'goalHours') && Number(req.body.goalHours) > 0;
   try {
     if (consent) await pool.query('UPDATE students SET consent=$1 WHERE id=$2', [consent.total || false, req.session.user_id]);
     await pool.query(`
@@ -1009,8 +1013,8 @@ async function periodRank(studentId, from) {
 //   כוכב: שבוע ראשון-שבת שהסתיים, לפחות 4 ימים מדודים ו-5 ימים ביעד.
 //   סוג כוכב לפי היעד: 3ש' זהב, 4ש' כסף, 5ש' ארד, 6ש'+ רגיל.
 //   שנה: 1.9 עד 31.8.
-//   גביע: כוכב מועדון (זהב/כסף/ארד) בכל שבועות החודש: בחודש עם 4 שבתות - 4 כוכבים,
-//   בחודש עם 5 שבתות - 5. כולם מאותו סוג = גביע מאותו סוג, אחרת משולב.
+//   גביע: כל 4 כוכבי מועדון (זהב/כסף/ארד) במהלך השנה, גם לא רצופים ובין חודשים.
+//   ארבעתם מאותו סוג = גביע מאותו סוג, אחרת משולב.
 //   רצף: ימים רצופים ביעד, מאתמול אחורה. יום בלי נתון לא שובר, חריגה שוברת.
 function isoAdd(d, n) {
   const t = new Date(d + 'T12:00:00Z'); t.setUTCDate(t.getUTCDate() + n); return t.toISOString().slice(0, 10);
@@ -1073,15 +1077,16 @@ function computeAchievements(rows, currentGoal, today, yearWindow) {
     if (type && measured >= 4 && metN >= 5) stars.push({ weekSaturday: sat, type });
   }
 
-  // גביעים
+  // גביעים: כל 4 כוכבי מועדון (זהב/כסף/ארד) במהלך השנה = גביע, גם אם אינם רצופים ואפילו בין חודשים.
+  // סוג הגביע לפי ארבעת הכוכבים שלו; החודש = החודש שבו הושלם.
   const trophies = [];
-  for (const m of [...new Set(stars.map(x => x.weekSaturday.slice(0, 7)))].sort()) {
-    const club = stars.filter(x => x.weekSaturday.startsWith(m) && x.type !== 'basic');
-    if (club.length >= saturdaysInWindow(m, yStart, yEnd)) {   // כוכב בכל שבוע של החודש
-      const t = ['gold', 'silver', 'bronze'].find(c => club.every(x => x.type === c)) || 'mixed';
-      trophies.push({ month: m, type: t });
-    }
+  const club = stars.filter(x => x.type !== 'basic');
+  for (let i = 3; i < club.length; i += 4) {
+    const four = club.slice(i - 3, i + 1);
+    const t = ['gold', 'silver', 'bronze'].find(c => four.every(x => x.type === c)) || 'mixed';
+    trophies.push({ month: club[i].weekSaturday.slice(0, 7), type: t, completedOn: club[i].weekSaturday });
   }
+  const trophyProgress = club.length % 4;   // כמה כוכבים כבר נאספו לגביע הבא (0-3)
 
   // השבוע הנוכחי (ראשון עד אתמול)
   const dow = new Date(today + 'T12:00:00Z').getUTCDay();
@@ -1097,12 +1102,83 @@ function computeAchievements(rows, currentGoal, today, yearWindow) {
     streak, stars, trophies,
     monthStars: stars.filter(x => x.weekSaturday.startsWith(curMonth)),
     monthWeeks: saturdaysInWindow(curMonth, yStart, yEnd) || 4,   // משבצות כוכב החודש (4 או 5)
-    trophyNeed: saturdaysInWindow(curMonth, yStart, yEnd),         // כוכבים לגביע החודש
+    trophyNeed: 4,                                                 // כל 4 כוכבי מועדון = גביע
+    trophyProgress,
     schoolYear: { start: yStart, end: yEnd },
     yearStars: stars.length,
     week: { met: weekMet, measured: weekMeasured },
   };
 }
+
+// ─── ניקוד משוקלל ודירוג מול כולם (כיתה / שכבה / כל הישיבה) ─────────────────────────
+// יום ביעד: 3ש' = 1.75 נק', 4ש' = 1.5, 5ש' = 1, 6ש' ומעלה = 0.5.
+// "נקודות הצלה": חריגה עד חצי שעה = חצי מהנקודות, עד שעה = רבע, מעבר לזה = 0.
+function goalWeight(g) { return g <= 3 ? 1.75 : g <= 4 ? 1.5 : g <= 5 ? 1 : 0.5; }
+function dayPoints(minutes, goalHours) {
+  if (!goalHours || goalHours <= 0 || minutes == null) return 0;
+  const w = goalWeight(goalHours), over = minutes - goalHours * 60;
+  if (over <= 0) return w;
+  if (over <= 30) return w / 2;
+  if (over <= 60) return w / 4;
+  return 0;
+}
+function gradeOf(cls) { return String(cls || '').replace(/\s*\d+\s*$/, '').trim(); }
+// טווח התקופה (עד אתמול; היום עוד לא נגמר). ביום ראשון / ב-1 לחודש - התקופה הקודמת המלאה.
+function rankRange(period, today) {
+  const y = isoAdd(today, -1);
+  if (period === 'week') {
+    const dow = new Date(today + 'T12:00:00Z').getUTCDay();
+    if (dow === 0) return { from: isoAdd(today, -7), to: y, label: 'השבוע שעבר' };
+    return { from: isoAdd(today, -dow), to: y, label: 'השבוע' };
+  }
+  if (period === 'month') {
+    if (today.slice(8) === '01') return { from: y.slice(0, 7) + '-01', to: y, label: 'החודש שעבר' };
+    return { from: today.slice(0, 7) + '-01', to: y, label: 'החודש' };
+  }
+  return { from: '2000-01-01', to: y, label: 'מאז ומעולם' };
+}
+
+app.get('/api/rank-board', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const scope = ['class', 'grade', 'school'].includes(req.query.scope) ? req.query.scope : 'class';
+    const period = ['week', 'month', 'ever'].includes(req.query.period) ? req.query.period : 'week';
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+    const { from, to, label } = rankRange(period, today);
+    const me = await pool.query('SELECT id, teacher_id, class_name FROM students WHERE id=$1', [req.session.user_id]);
+    if (!me.rows.length) return res.status(404).json({ error: 'תלמיד לא נמצא' });
+    const { teacher_id, class_name } = me.rows[0];
+    const r = await pool.query(`
+      SELECT s.id, s.class_name, h.day_minutes AS m, COALESCE(h.goal_hours, rp.goal_hours) AS g
+      FROM students s
+      JOIN reports_history h ON h.student_id = s.id
+      LEFT JOIN reports rp ON rp.student_id = s.id
+      WHERE s.teacher_id = $1 AND s.consent = TRUE AND COALESCE(s.active, TRUE) = TRUE
+        AND h.day_minutes IS NOT NULL AND h.report_date::date BETWEEN $2::date AND $3::date
+    `, [teacher_id, from, to]);
+    const inScope = c => scope === 'school' ? true
+      : scope === 'grade' ? gradeOf(c) === gradeOf(class_name) : String(c || '') === String(class_name || '');
+    const pts = {}, days = {};
+    for (const row of r.rows) {
+      if (!inScope(row.class_name)) continue;
+      pts[row.id] = (pts[row.id] || 0) + dayPoints(Number(row.m), row.g != null ? Number(row.g) : null);
+      days[row.id] = (days[row.id] || 0) + 1;
+    }
+    const list = Object.entries(pts).map(([id, p]) => ({ id: Number(id), p: Math.round(p * 100) / 100 }))
+      .sort((a, b) => b.p - a.p);
+    const mine = list.find(x => x.id === req.session.user_id);
+    const rank = mine ? 1 + list.filter(x => x.p > mine.p).length : null;
+    const ahead = mine ? list.filter(x => x.p > mine.p).map(x => x.p) : [];
+    res.json({
+      ok: true, scope, period, from, to, label,
+      scopeName: scope === 'school' ? 'כל הישיבה' : scope === 'grade' ? `שכבת ${gradeOf(class_name)}` : `כיתה ${class_name || ''}`,
+      total: list.length,
+      me: mine ? { points: mine.p, rank, days: days[mine.id] } : null,
+      top: list.length ? list[0].p : null,
+      nextUp: ahead.length ? Math.min(...ahead) : null,   // הניקוד של המקום שמעליי
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // שם השנה העברית של שנת ההישגים: ספטמבר 2026 - אוגוסט 2027 = תשפ"ז
 function hebrewYearLabel(startY) {
