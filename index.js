@@ -224,7 +224,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-zikki' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-zikki2' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1241,17 +1241,21 @@ app.get('/api/rank-board', auth, async (req, res) => {
   } catch (e) { console.error('rank-board', e.message); res.status(500).json({ error: e.message }); }
 });
 
-// ─── זיקי: מצב הדמות של התלמיד (6.80+) ─────────────────────────────────────
-// קדימות: ישן > בלחץ > אלוף > על הלהבה > טס למעלה > רגוע. הצבעים והטקסטים מכאן,
-// כך שאפשר לשנות אותם בלי עדכון גרסה.
-const MASCOT = {
-  sleep:  { color: '#A9A6BC', name: 'זיקי ישן' },
-  stress: { color: '#E0465A', name: 'זיקי בלחץ' },
-  champ:  { color: '#F2B632', name: 'זיקי אלוף' },
-  fire:   { color: '#F26B3A', name: 'זיקי על הלהבה' },
-  up:     { color: '#3CC59A', name: 'זיקי טס למעלה' },
-  calm:   { color: '#7B72E0', name: 'זיקי רגוע' },
-};
+// ─── זיקי: הצבע לפי המקום בדירוג הכיתה השבוע (6.80+) ──────────────────────
+// מקום ראשון = זהב, ומשם הצבע עובר בהדרגה: ירוק -> כחול -> סגול -> כתום-אלמוג (אחרון).
+// בלי נתונים בשבוע = אפור וישן. הצבעים והטקסטים מכאן - שינוי בלי עדכון גרסה.
+const MASCOT_RAMP = [[0, '#F2B632'], [0.25, '#3CC59A'], [0.5, '#4FA3E8'], [0.75, '#7B72E0'], [1, '#F26B3A']];
+function rampColor(t) {
+  const hx = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  for (let i = 1; i < MASCOT_RAMP.length; i++) {
+    const [t1, c1] = MASCOT_RAMP[i];
+    if (t <= t1) {
+      const [t0, c0] = MASCOT_RAMP[i - 1], k = (t - t0) / (t1 - t0), A = hx(c0), B = hx(c1);
+      return '#' + A.map((v, j) => Math.round(v + (B[j] - v) * k).toString(16).padStart(2, '0')).join('');
+    }
+  }
+  return MASCOT_RAMP[MASCOT_RAMP.length - 1][1];
+}
 app.get('/api/mascot', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   try {
@@ -1260,35 +1264,18 @@ app.get('/api/mascot', auth, async (req, res) => {
     const me = await pool.query('SELECT teacher_id, class_name FROM students WHERE id=$1', [selfId]);
     if (!me.rows.length) return res.status(404).json({ error: 'תלמיד לא נמצא' });
     const { teacher_id, class_name } = me.rows[0];
-    const g = await pool.query('SELECT goal_hours FROM reports WHERE student_id=$1', [selfId]);
-    const goal = g.rows[0]?.goal_hours != null ? Number(g.rows[0].goal_hours) : null;
-    const h = await pool.query(`
-      SELECT report_date::date::text AS date, day_minutes AS minutes, goal_hours AS goal
-      FROM reports_history
-      WHERE student_id = $1 AND day_minutes IS NOT NULL AND report_date::date >= ($2::date - INTERVAL '420 days')
-    `, [selfId, today]);
-    const rows = h.rows.map(r => ({ date: r.date, minutes: Number(r.minutes), goal: r.goal != null ? Number(r.goal) : null }));
-    const { streak } = computeAchievements(rows, goal, today);
-    const byDate = {}; for (const r of rows) byDate[r.date] = r;
-    const y1 = byDate[isoAdd(today, -1)], y2 = byDate[isoAdd(today, -2)];
-    const g1 = y1 ? (y1.goal || goal) : null;
-    const over1 = y1 && g1 ? y1.minutes > g1 * 60 + 1 : false;
-    // דירוג הכיתה השבוע: עד אתמול, ועד שלשום (לזיהוי עלייה)
-    const wk = rankRange('week', today);
-    const nowL = await rankList(teacher_id, class_name, 'class', wk.from, wk.to, selfId);
-    const rankNow = rankOf(nowL.list, selfId);
-    let rankPrev = null;
-    const prevTo = isoAdd(wk.to, -1);
-    if (prevTo >= wk.from) rankPrev = rankOf((await rankList(teacher_id, class_name, 'class', wk.from, prevTo, selfId)).list, selfId);
-
-    let mood, when;
-    if (!y1 && !y2) { mood = 'sleep'; when = 'יומיים בלי נתונים. הקש עליו כדי להעיר אותו'; }
-    else if (over1) { mood = 'stress'; when = 'חרגת מהיעד אתמול. היום מתחילים מחדש'; }
-    else if (rankNow && rankNow <= 3) { mood = 'champ'; when = `מקום ${rankNow} בכיתה ${wk.label}`; }
-    else if (streak >= 7) { mood = 'fire'; when = `רצף של ${streak} ימים ביעד`; }
-    else if (rankNow && rankPrev && rankNow < rankPrev) { mood = 'up'; when = `עלית ממקום ${rankPrev} למקום ${rankNow}`; }
-    else { mood = 'calm'; when = y1 && !over1 ? 'אתמול היית ביעד' : 'ממשיכים בשקט'; }
-    res.json({ ok: true, mood, color: MASCOT[mood].color, name: MASCOT[mood].name, when, streak, rank: rankNow });
+    let wk = rankRange('week', today);
+    let L = await rankList(teacher_id, class_name, 'class', wk.from, wk.to, selfId);
+    if (!L.list.some(x => x.id === selfId)) {          // תחילת שבוע - השבוע שעבר המלא
+      wk = rankRange('week', today, 1);
+      L = await rankList(teacher_id, class_name, 'class', wk.from, wk.to, selfId);
+    }
+    const rank = rankOf(L.list, selfId), total = L.list.length;
+    if (!rank) return res.json({ ok: true, mood: 'sleep', color: '#A9A6BC', name: 'זיקי ישן', when: 'עוד אין לך נקודות השבוע', rank: null, total });
+    const t = total > 1 ? (rank - 1) / (total - 1) : 0;
+    const mood = rank <= 3 ? 'champ' : 'calm';
+    res.json({ ok: true, mood, color: rampColor(t), name: rank <= 3 ? 'זיקי אלוף' : 'זיקי',
+      when: `מקום ${rank} מתוך ${total} בכיתה ${wk.label}`, rank, total });
   } catch (e) { console.error('mascot', e.message); res.status(500).json({ error: e.message }); }
 });
 
