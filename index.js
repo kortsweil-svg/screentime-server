@@ -224,7 +224,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-zikki3' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-ties' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1221,14 +1221,19 @@ app.get('/api/rank-board', auth, async (req, res) => {
       if (rank > (podium.length ? podium[podium.length - 1].rank : 0) + 1) rows.push({ gap: true });
       rows.push({ rank: String(rank), title: 'אני', value: fmtP(mine.p), hl: true });
     }
+    // תיקו: כמה תלמידים חולקים איתי את אותו ניקוד (למשל כולם עם 0 נקודות)
+    const ties = mine ? list.filter(x => x.p === mine.p).length - 1 : 0;
     const view = {
       header: `${scopeName} · ${label}${list.length ? ` · ${list.length} תלמידים` : ''}`,
       rows,
       tiles: mine ? [
-        { value: `מקום ${rank}`, label: `מתוך ${list.length}`, accent: true },
-        nextUp != null ? { value: `+${fmtP(nextUp - mine.p)}`, label: 'נקודות עד המקום שמעליי' } : { value: '👑', label: 'אתה בראש!' },
+        { value: `מקום ${rank}`, label: ties > 0 ? `מתוך ${list.length} · בתיקו עם ${ties}` : `מתוך ${list.length}`, accent: true },
+        nextUp != null ? { value: `+${fmtP(nextUp - mine.p)}`, label: 'נקודות עד המקום שמעליי' }
+          : mine.p === 0 ? { value: '0', label: 'נקודות' } : { value: '👑', label: 'אתה בראש!' },
       ] : [],
-      note: mine ? null : `עוד אין לך נקודות ב${label}.\nכל יום ביעד מכניס אותך לדירוג.`,
+      note: !mine ? `עוד אין לך נקודות ב${label}.\nכל יום ביעד מכניס אותך לדירוג.`
+        : mine.p === 0 ? `עוד אין לך נקודות ב${label} – כל התלמידים בלי נקודות חולקים את אותו מקום.\nיום ביעד, או חריגה של עד שעה, מזכה בנקודות.`
+        : null,
       info: RANK_INFO,
     };
     res.json({
