@@ -224,7 +224,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-rank3' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-zikki' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1150,55 +1150,146 @@ function rankRange(period, today, back = 0) {
   return { from: '2000-01-01', to: y, label: 'מאז ומעולם' };
 }
 
+// רשימת דירוג לתקופה ולהיקף (כיתה/שכבה/ישיבה). התלמיד עצמו תמיד נספר, אחרים רק עם הסכמה.
+async function rankList(teacherId, className, scope, from, to, selfId) {
+  const r = await pool.query(`
+    SELECT s.id, s.name, s.class_name, h.day_minutes AS m,
+           COALESCE(NULLIF(h.goal_hours::text, '')::numeric, NULLIF(rp.goal_hours::text, '')::numeric) AS g
+    FROM students s
+    JOIN reports_history h ON h.student_id = s.id
+    LEFT JOIN reports rp ON rp.student_id = s.id
+    WHERE s.teacher_id = $1
+      AND ((s.consent = TRUE AND COALESCE(s.active, TRUE) = TRUE) OR s.id = $4)
+      AND h.day_minutes IS NOT NULL AND h.report_date::date BETWEEN $2::date AND $3::date
+  `, [teacherId, from, to, selfId]);
+  const inScope = c => scope === 'school' ? true
+    : scope === 'grade' ? gradeOf(c) === gradeOf(className) : String(c || '') === String(className || '');
+  const pts = {}, days = {}, who = {};
+  for (const row of r.rows) {
+    if (!inScope(row.class_name)) continue;
+    who[row.id] = { name: row.name, cls: row.class_name };
+    pts[row.id] = (pts[row.id] || 0) + dayPoints(Number(row.m), row.g != null ? Number(row.g) : null);
+    days[row.id] = (days[row.id] || 0) + 1;
+  }
+  // id הוא מחרוזת hex (לא מספר), לכן משווים כמחרוזת
+  const list = Object.entries(pts).map(([id, p]) => ({ id, p: Math.round(p * 100) / 100 })).sort((a, b) => b.p - a.p);
+  return { list, who, days };
+}
+const rankOf = (list, id) => { const m = list.find(x => x.id === id); return m ? 1 + list.filter(x => x.p > m.p).length : null; };
+const fmtP = p => String(Math.round(p * 100) / 100);
+
+// הסבר הניקוד - נשלח מהשרת, כך שאפשר לשנות אותו בלי עדכון גרסה
+const RANK_INFO = {
+  title: 'איך צוברים נקודות?',
+  text: 'כל יום ביעד מזכה בנקודות – ככל שהיעד מאתגר יותר, יותר נקודות:\nיעד 3 שעות: 1.75 · יעד 4: 1.5 · יעד 5: 1 · יעד 6: 0.5\nחרגת? לא נורא – עצור מהר:\nעד חצי שעה מעל היעד = חצי מהנקודות · עד שעה = רבע',
+};
+
 app.get('/api/rank-board', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   try {
     const scope = ['class', 'grade', 'school'].includes(req.query.scope) ? req.query.scope : 'class';
     const period = ['week', 'month', 'ever'].includes(req.query.period) ? req.query.period : 'week';
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+    const selfId = req.session.user_id;
     let { from, to, label } = rankRange(period, today);
-    const me = await pool.query('SELECT id, teacher_id, class_name FROM students WHERE id=$1', [req.session.user_id]);
+    const me = await pool.query('SELECT id, teacher_id, class_name FROM students WHERE id=$1', [selfId]);
     if (!me.rows.length) return res.status(404).json({ error: 'תלמיד לא נמצא' });
     const { teacher_id, class_name } = me.rows[0];
     // בתחילת שבוע/חודש (עוד אין לי ימים בתקופה) - מציגים את התקופה הקודמת המלאה
     if (period !== 'ever') {
       const mineNow = await pool.query(`SELECT 1 FROM reports_history WHERE student_id=$1 AND day_minutes IS NOT NULL
-        AND report_date::date BETWEEN $2::date AND $3::date LIMIT 1`, [req.session.user_id, from, to]);
+        AND report_date::date BETWEEN $2::date AND $3::date LIMIT 1`, [selfId, from, to]);
       if (!mineNow.rows.length) ({ from, to, label } = rankRange(period, today, 1));
     }
-    const r = await pool.query(`
-      SELECT s.id, s.class_name, h.day_minutes AS m,
-             COALESCE(NULLIF(h.goal_hours::text, '')::numeric, NULLIF(rp.goal_hours::text, '')::numeric) AS g
-      FROM students s
-      JOIN reports_history h ON h.student_id = s.id
-      LEFT JOIN reports rp ON rp.student_id = s.id
-      WHERE s.teacher_id = $1
-        AND ((s.consent = TRUE AND COALESCE(s.active, TRUE) = TRUE) OR s.id = $4)   -- התלמיד עצמו תמיד נספר
-        AND h.day_minutes IS NOT NULL AND h.report_date::date BETWEEN $2::date AND $3::date
-    `, [teacher_id, from, to, req.session.user_id]);
-    const inScope = c => scope === 'school' ? true
-      : scope === 'grade' ? gradeOf(c) === gradeOf(class_name) : String(c || '') === String(class_name || '');
-    const pts = {}, days = {};
-    for (const row of r.rows) {
-      if (!inScope(row.class_name)) continue;
-      pts[row.id] = (pts[row.id] || 0) + dayPoints(Number(row.m), row.g != null ? Number(row.g) : null);
-      days[row.id] = (days[row.id] || 0) + 1;
-    }
-    // id הוא מחרוזת hex (לא מספר), לכן משווים כמחרוזת
-    const list = Object.entries(pts).map(([id, p]) => ({ id, p: Math.round(p * 100) / 100 }))
-      .sort((a, b) => b.p - a.p);
-    const mine = list.find(x => x.id === req.session.user_id);
-    const rank = mine ? 1 + list.filter(x => x.p > mine.p).length : null;
+    const { list, who, days } = await rankList(teacher_id, class_name, scope, from, to, selfId);
+    const mine = list.find(x => x.id === selfId);
+    const rank = rankOf(list, selfId);
     const ahead = mine ? list.filter(x => x.p > mine.p).map(x => x.p) : [];
+    const nextUp = ahead.length ? Math.min(...ahead) : null;
+    const scopeName = scope === 'school' ? 'כל הישיבה' : scope === 'grade' ? `שכבת ${gradeOf(class_name)}` : `כיתה ${class_name || ''}`;
+    // מקומות 1-3 (בתיקו - אותו מקום; לכל היותר 5 שורות)
+    const podium = [];
+    for (const x of list) {
+      const rk = 1 + list.filter(y => y.p > x.p).length;
+      if (rk > 3 || podium.length >= 5) break;
+      podium.push({ rank: rk, name: who[x.id]?.name || '', cls: scope === 'class' ? null : (who[x.id]?.cls || null), points: x.p, me: x.id === selfId });
+    }
+    // ─── התצוגה עצמה, מוכנה לציור (6.80+). שינוי כאן לא דורש עדכון גרסה ───
+    const MEDAL = { 1: '🥇', 2: '🥈', 3: '🥉' };
+    const rows = podium.map(p => ({ icon: MEDAL[p.rank], title: p.me ? `${p.name} (אתה)` : p.name, sub: p.cls, value: fmtP(p.points), hl: p.me }));
+    if (mine && !podium.some(p => p.me)) {
+      if (rank > (podium.length ? podium[podium.length - 1].rank : 0) + 1) rows.push({ gap: true });
+      rows.push({ rank: String(rank), title: 'אני', value: fmtP(mine.p), hl: true });
+    }
+    const view = {
+      header: `${scopeName} · ${label}${list.length ? ` · ${list.length} תלמידים` : ''}`,
+      rows,
+      tiles: mine ? [
+        { value: `מקום ${rank}`, label: `מתוך ${list.length}`, accent: true },
+        nextUp != null ? { value: `+${fmtP(nextUp - mine.p)}`, label: 'נקודות עד המקום שמעליי' } : { value: '👑', label: 'אתה בראש!' },
+      ] : [],
+      note: mine ? null : `עוד אין לך נקודות ב${label}.\nכל יום ביעד מכניס אותך לדירוג.`,
+      info: RANK_INFO,
+    };
     res.json({
-      ok: true, scope, period, from, to, label,
-      scopeName: scope === 'school' ? 'כל הישיבה' : scope === 'grade' ? `שכבת ${gradeOf(class_name)}` : `כיתה ${class_name || ''}`,
+      ok: true, scope, period, from, to, label, scopeName,
       total: list.length,
       me: mine ? { points: mine.p, rank, days: days[mine.id] } : null,
       top: list.length ? list[0].p : null,
-      nextUp: ahead.length ? Math.min(...ahead) : null,   // הניקוד של המקום שמעליי
+      podium, nextUp, view,
     });
   } catch (e) { console.error('rank-board', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ─── זיקי: מצב הדמות של התלמיד (6.80+) ─────────────────────────────────────
+// קדימות: ישן > בלחץ > אלוף > על הלהבה > טס למעלה > רגוע. הצבעים והטקסטים מכאן,
+// כך שאפשר לשנות אותם בלי עדכון גרסה.
+const MASCOT = {
+  sleep:  { color: '#A9A6BC', name: 'זיקי ישן' },
+  stress: { color: '#E0465A', name: 'זיקי בלחץ' },
+  champ:  { color: '#F2B632', name: 'זיקי אלוף' },
+  fire:   { color: '#F26B3A', name: 'זיקי על הלהבה' },
+  up:     { color: '#3CC59A', name: 'זיקי טס למעלה' },
+  calm:   { color: '#7B72E0', name: 'זיקי רגוע' },
+};
+app.get('/api/mascot', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const selfId = req.session.user_id;
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+    const me = await pool.query('SELECT teacher_id, class_name FROM students WHERE id=$1', [selfId]);
+    if (!me.rows.length) return res.status(404).json({ error: 'תלמיד לא נמצא' });
+    const { teacher_id, class_name } = me.rows[0];
+    const g = await pool.query('SELECT goal_hours FROM reports WHERE student_id=$1', [selfId]);
+    const goal = g.rows[0]?.goal_hours != null ? Number(g.rows[0].goal_hours) : null;
+    const h = await pool.query(`
+      SELECT report_date::date::text AS date, day_minutes AS minutes, goal_hours AS goal
+      FROM reports_history
+      WHERE student_id = $1 AND day_minutes IS NOT NULL AND report_date::date >= ($2::date - INTERVAL '420 days')
+    `, [selfId, today]);
+    const rows = h.rows.map(r => ({ date: r.date, minutes: Number(r.minutes), goal: r.goal != null ? Number(r.goal) : null }));
+    const { streak } = computeAchievements(rows, goal, today);
+    const byDate = {}; for (const r of rows) byDate[r.date] = r;
+    const y1 = byDate[isoAdd(today, -1)], y2 = byDate[isoAdd(today, -2)];
+    const g1 = y1 ? (y1.goal || goal) : null;
+    const over1 = y1 && g1 ? y1.minutes > g1 * 60 + 1 : false;
+    // דירוג הכיתה השבוע: עד אתמול, ועד שלשום (לזיהוי עלייה)
+    const wk = rankRange('week', today);
+    const nowL = await rankList(teacher_id, class_name, 'class', wk.from, wk.to, selfId);
+    const rankNow = rankOf(nowL.list, selfId);
+    let rankPrev = null;
+    const prevTo = isoAdd(wk.to, -1);
+    if (prevTo >= wk.from) rankPrev = rankOf((await rankList(teacher_id, class_name, 'class', wk.from, prevTo, selfId)).list, selfId);
+
+    let mood, when;
+    if (!y1 && !y2) { mood = 'sleep'; when = 'יומיים בלי נתונים. הקש עליו כדי להעיר אותו'; }
+    else if (over1) { mood = 'stress'; when = 'חרגת מהיעד אתמול. היום מתחילים מחדש'; }
+    else if (rankNow && rankNow <= 3) { mood = 'champ'; when = `מקום ${rankNow} בכיתה ${wk.label}`; }
+    else if (streak >= 7) { mood = 'fire'; when = `רצף של ${streak} ימים ביעד`; }
+    else if (rankNow && rankPrev && rankNow < rankPrev) { mood = 'up'; when = `עלית ממקום ${rankPrev} למקום ${rankNow}`; }
+    else { mood = 'calm'; when = y1 && !over1 ? 'אתמול היית ביעד' : 'ממשיכים בשקט'; }
+    res.json({ ok: true, mood, color: MASCOT[mood].color, name: MASCOT[mood].name, when, streak, rank: rankNow });
+  } catch (e) { console.error('mascot', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // שם השנה העברית של שנת ההישגים: ספטמבר 2026 - אוגוסט 2027 = תשפ"ז
