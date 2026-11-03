@@ -224,7 +224,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-zikki2' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-zikki3' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1241,10 +1241,17 @@ app.get('/api/rank-board', auth, async (req, res) => {
   } catch (e) { console.error('rank-board', e.message); res.status(500).json({ error: e.message }); }
 });
 
-// ─── זיקי: הצבע לפי המקום בדירוג הכיתה השבוע (6.80+) ──────────────────────
-// מקום ראשון = זהב, ומשם הצבע עובר בהדרגה: ירוק -> כחול -> סגול -> כתום-אלמוג (אחרון).
-// בלי נתונים בשבוע = אפור וישן. הצבעים והטקסטים מכאן - שינוי בלי עדכון גרסה.
-const MASCOT_RAMP = [[0, '#F2B632'], [0.25, '#3CC59A'], [0.5, '#4FA3E8'], [0.75, '#7B72E0'], [1, '#F26B3A']];
+// ─── זיקי: מצב לפי המקום בדירוג הכיתה השבוע (6.80+) ──────────────────────
+// ככל שהמקום יורד, זיקי דוהה ונחלש: אלוף -> שמח -> רגיל -> עייף -> חולה -> מת.
+// בלי נתונים בשבוע = ישן. הספים, הצבעים והטקסטים מכאן - שינוי בלי עדכון גרסה.
+const MASCOT_RAMP = [[0, '#F2B632'], [0.35, '#3CC59A'], [0.6, '#4FA3E8'], [0.8, '#8F86C9'], [0.97, '#A8B07A'], [1, '#9A97A8']];
+const MASCOT_STAGES = [   // לפי t = המיקום היחסי בכיתה (0 = ראשון, 1 = אחרון)
+  { upTo: 0.35, mood: 'happy', name: 'זיקי שמח' },
+  { upTo: 0.6,  mood: 'calm',  name: 'זיקי' },
+  { upTo: 0.8,  mood: 'tired', name: 'זיקי עייף' },
+  { upTo: 0.97, mood: 'sick',  name: 'זיקי חולה' },   // רק האחרון מגיע ל'מת'
+  { upTo: 1,    mood: 'dead',  name: 'זיקי מת' },
+];
 function rampColor(t) {
   const hx = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
   for (let i = 1; i < MASCOT_RAMP.length; i++) {
@@ -1273,9 +1280,11 @@ app.get('/api/mascot', auth, async (req, res) => {
     const rank = rankOf(L.list, selfId), total = L.list.length;
     if (!rank) return res.json({ ok: true, mood: 'sleep', color: '#A9A6BC', name: 'זיקי ישן', when: 'עוד אין לך נקודות השבוע', rank: null, total });
     const t = total > 1 ? (rank - 1) / (total - 1) : 0;
-    const mood = rank <= 3 ? 'champ' : 'calm';
-    res.json({ ok: true, mood, color: rampColor(t), name: rank <= 3 ? 'זיקי אלוף' : 'זיקי',
-      when: `מקום ${rank} מתוך ${total} בכיתה ${wk.label}`, rank, total });
+    const st = rank <= 3 ? { mood: 'champ', name: 'זיקי אלוף' } : (MASCOT_STAGES.find(x => t <= x.upTo) || MASCOT_STAGES[MASCOT_STAGES.length - 1]);
+    const tail = st.mood === 'dead' ? ' · יום ביעד יחזיר אותו לחיים'
+      : st.mood === 'sick' ? ' · יום ביעד ירפא אותו' : '';
+    res.json({ ok: true, mood: st.mood, color: st.mood === 'champ' ? '#F2B632' : rampColor(t), name: st.name,
+      when: `מקום ${rank} מתוך ${total} בכיתה ${wk.label}${tail}`, rank, total });
   } catch (e) { console.error('mascot', e.message); res.status(500).json({ error: e.message }); }
 });
 
