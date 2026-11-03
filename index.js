@@ -149,7 +149,7 @@ async function initDB() {
                -- לא ישנה בדיעבד ימים שכבר נסגרו. בלי יעד שמור ליום - היעד הנוכחי.
                COUNT(h.student_id) FILTER (
                  WHERE h.day_minutes IS NOT NULL
-                   AND h.day_minutes <= COALESCE(NULLIF(h.goal_hours::numeric, 0), m.goal_hours) * 60
+                   AND h.day_minutes <= COALESCE(NULLIF(h.goal_hours::numeric, 0), m.goal_hours) * 60 + 1
                )::int AS days_met,
                COUNT(h.student_id) FILTER (WHERE h.day_minutes IS NOT NULL)::int AS days_reported
         FROM members m
@@ -983,7 +983,7 @@ async function periodRank(studentId, from) {
     stats AS (
       SELECT s.id,
         COUNT(h.student_id) FILTER (WHERE h.day_minutes IS NOT NULL
-          AND h.day_minutes <= COALESCE(NULLIF(h.goal_hours::numeric, 0), me.goal_hours) * 60)::int AS met,
+          AND h.day_minutes <= COALESCE(NULLIF(h.goal_hours::numeric, 0), me.goal_hours) * 60 + 1)::int AS met,
         COUNT(h.student_id) FILTER (WHERE h.day_minutes IS NOT NULL)::int AS rep
       FROM me
       JOIN students s ON s.teacher_id = me.teacher_id AND s.active = TRUE AND s.consent = TRUE
@@ -1047,7 +1047,8 @@ function starTypeFor(g) { return g === 3 ? 'gold' : g === 4 ? 'silver' : g === 5
 function computeAchievements(rows, currentGoal, today, yearWindow) {
   const days = {};
   for (const r of rows) if (r.minutes != null) days[r.date] = { minutes: r.minutes, goal: r.goal || currentGoal || null };
-  const met = d => d && d.goal ? d.minutes <= d.goal * 60 : null;
+  // דקה אחת של סובלנות: באייפון יום נשמר עם דקה נוספת (0 ≠ "אין נתון"), ולכן 3:00 נשמר כ-3:01.
+  const met = d => d && d.goal ? d.minutes <= d.goal * 60 + 1 : null;
 
   // רצף
   let streak = 0;
@@ -1071,7 +1072,7 @@ function computeAchievements(rows, currentGoal, today, yearWindow) {
       const d = days[iso];
       if (!d || !d.goal) continue;
       goal = d.goal; measured++;
-      if (d.minutes <= d.goal * 60) metN++;
+      if (d.minutes <= d.goal * 60 + 1) metN++;
     }
     const type = starTypeFor(goal);
     if (type && measured >= 4 && metN >= 5) stars.push({ weekSaturday: sat, type });
@@ -1116,7 +1117,7 @@ function computeAchievements(rows, currentGoal, today, yearWindow) {
 function goalWeight(g) { return g <= 3 ? 1.75 : g <= 4 ? 1.5 : g <= 5 ? 1 : 0.5; }
 function dayPoints(minutes, goalHours) {
   if (!goalHours || goalHours <= 0 || minutes == null) return 0;
-  const w = goalWeight(goalHours), over = minutes - goalHours * 60;
+  const w = goalWeight(goalHours), over = minutes - goalHours * 60 - 1;   // דקת הסובלנות של אייפון
   if (over <= 0) return w;
   if (over <= 30) return w / 2;
   if (over <= 60) return w / 4;
@@ -1124,7 +1125,18 @@ function dayPoints(minutes, goalHours) {
 }
 function gradeOf(cls) { return String(cls || '').replace(/\s*\d+\s*$/, '').trim(); }
 // טווח התקופה (עד אתמול; היום עוד לא נגמר). ביום ראשון / ב-1 לחודש - התקופה הקודמת המלאה.
-function rankRange(period, today) {
+function rankRange(period, today, back = 0) {
+  if (back) {   // התקופה הקודמת המלאה
+    if (period === 'week') {
+      const dow = new Date(today + 'T12:00:00Z').getUTCDay();
+      const sun = isoAdd(today, -dow - 7);
+      return { from: sun, to: isoAdd(sun, 6), label: 'השבוע שעבר' };
+    }
+    if (period === 'month') {
+      const first = today.slice(0, 7) + '-01', lastPrev = isoAdd(first, -1);
+      return { from: lastPrev.slice(0, 7) + '-01', to: lastPrev, label: 'החודש שעבר' };
+    }
+  }
   const y = isoAdd(today, -1);
   if (period === 'week') {
     const dow = new Date(today + 'T12:00:00Z').getUTCDay();
@@ -1144,10 +1156,16 @@ app.get('/api/rank-board', auth, async (req, res) => {
     const scope = ['class', 'grade', 'school'].includes(req.query.scope) ? req.query.scope : 'class';
     const period = ['week', 'month', 'ever'].includes(req.query.period) ? req.query.period : 'week';
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
-    const { from, to, label } = rankRange(period, today);
+    let { from, to, label } = rankRange(period, today);
     const me = await pool.query('SELECT id, teacher_id, class_name FROM students WHERE id=$1', [req.session.user_id]);
     if (!me.rows.length) return res.status(404).json({ error: 'תלמיד לא נמצא' });
     const { teacher_id, class_name } = me.rows[0];
+    // בתחילת שבוע/חודש (עוד אין לי ימים בתקופה) - מציגים את התקופה הקודמת המלאה
+    if (period !== 'ever') {
+      const mineNow = await pool.query(`SELECT 1 FROM reports_history WHERE student_id=$1 AND day_minutes IS NOT NULL
+        AND report_date::date BETWEEN $2::date AND $3::date LIMIT 1`, [req.session.user_id, from, to]);
+      if (!mineNow.rows.length) ({ from, to, label } = rankRange(period, today, 1));
+    }
     const r = await pool.query(`
       SELECT s.id, s.class_name, h.day_minutes AS m, COALESCE(h.goal_hours, rp.goal_hours) AS g
       FROM students s
