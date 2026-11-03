@@ -224,7 +224,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-rank2' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-rank3' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1184,7 +1184,8 @@ app.get('/api/rank-board', auth, async (req, res) => {
       pts[row.id] = (pts[row.id] || 0) + dayPoints(Number(row.m), row.g != null ? Number(row.g) : null);
       days[row.id] = (days[row.id] || 0) + 1;
     }
-    const list = Object.entries(pts).map(([id, p]) => ({ id: Number(id), p: Math.round(p * 100) / 100 }))
+    // id הוא מחרוזת hex (לא מספר), לכן משווים כמחרוזת
+    const list = Object.entries(pts).map(([id, p]) => ({ id, p: Math.round(p * 100) / 100 }))
       .sort((a, b) => b.p - a.p);
     const mine = list.find(x => x.id === req.session.user_id);
     const rank = mine ? 1 + list.filter(x => x.p > mine.p).length : null;
