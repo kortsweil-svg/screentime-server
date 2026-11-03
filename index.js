@@ -224,7 +224,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok' }));
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-rank2' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1167,13 +1167,15 @@ app.get('/api/rank-board', auth, async (req, res) => {
       if (!mineNow.rows.length) ({ from, to, label } = rankRange(period, today, 1));
     }
     const r = await pool.query(`
-      SELECT s.id, s.class_name, h.day_minutes AS m, COALESCE(h.goal_hours, rp.goal_hours) AS g
+      SELECT s.id, s.class_name, h.day_minutes AS m,
+             COALESCE(NULLIF(h.goal_hours::text, '')::numeric, NULLIF(rp.goal_hours::text, '')::numeric) AS g
       FROM students s
       JOIN reports_history h ON h.student_id = s.id
       LEFT JOIN reports rp ON rp.student_id = s.id
-      WHERE s.teacher_id = $1 AND s.consent = TRUE AND COALESCE(s.active, TRUE) = TRUE
+      WHERE s.teacher_id = $1
+        AND ((s.consent = TRUE AND COALESCE(s.active, TRUE) = TRUE) OR s.id = $4)   -- התלמיד עצמו תמיד נספר
         AND h.day_minutes IS NOT NULL AND h.report_date::date BETWEEN $2::date AND $3::date
-    `, [teacher_id, from, to]);
+    `, [teacher_id, from, to, req.session.user_id]);
     const inScope = c => scope === 'school' ? true
       : scope === 'grade' ? gradeOf(c) === gradeOf(class_name) : String(c || '') === String(class_name || '');
     const pts = {}, days = {};
@@ -1195,7 +1197,7 @@ app.get('/api/rank-board', auth, async (req, res) => {
       top: list.length ? list[0].p : null,
       nextUp: ahead.length ? Math.min(...ahead) : null,   // הניקוד של המקום שמעליי
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('rank-board', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // שם השנה העברית של שנת ההישגים: ספטמבר 2026 - אוגוסט 2027 = תשפ"ז
