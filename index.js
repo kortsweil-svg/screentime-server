@@ -69,6 +69,7 @@ async function initDB() {
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS push_sent_at TIMESTAMP;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS sync_source TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS missing_ok BOOLEAN;   -- האפליקציה יודעת לדווח יום חסר בקוד
+    ALTER TABLE reports_history ADD COLUMN IF NOT EXISTS source TEXT;   -- 'code' = דווח בקוד מהכרטיס
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS app_version TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS goal_hours NUMERIC;
     -- דקות השימוש של אותו יום בלבד. total_minutes הוא שעות מצטברות
@@ -225,7 +226,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-05-missing2' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-05-codemark' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -673,7 +674,7 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
       ORDER BY s.class_name, s.name
     `, [req.session.teacher_id]);
     const hist = await pool.query(`
-      SELECT h.student_id, h.report_date::date::text AS d, h.day_minutes, h.goal_hours
+      SELECT h.student_id, h.report_date::date::text AS d, h.day_minutes, h.goal_hours, h.source
       FROM reports_history h
       JOIN students s ON s.id = h.student_id
       WHERE s.teacher_id = $1
@@ -688,6 +689,7 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
         date: h.d,
         minutes: h.day_minutes,
         goalHours: h.goal_hours !== null ? parseFloat(h.goal_hours) : null,
+        ...(h.source === 'code' ? { code: true } : {}),
       });
     }
     const sy = schoolYear(today);
@@ -1425,9 +1427,10 @@ app.post('/api/ios-day-code', auth, async (req, res) => {
     const goalHours = Number.isFinite(goalMinutes) && goalMinutes > 0 ? goalMinutes / 60 : null;
     const stored = minutes >= 15 ? minutes + 1 : minutes;
     await pool.query(`
-      INSERT INTO reports_history (id, student_id, platform, report_date, synced_at, goal_hours, day_minutes)
-      VALUES ($1,$2,'ios',$3,$4,$5,$6)
+      INSERT INTO reports_history (id, student_id, platform, report_date, synced_at, goal_hours, day_minutes, source)
+      VALUES ($1,$2,'ios',$3,$4,$5,$6,'code')
       ON CONFLICT (student_id, report_date) DO UPDATE SET
+        source = 'code',
         -- תיקון של המורה (נעול עם זמן) נשאר; יום נעול ריק מתמלא מהקוד ונפתח
         day_minutes = CASE WHEN reports_history.locked AND reports_history.day_minutes IS NOT NULL
                            THEN reports_history.day_minutes ELSE EXCLUDED.day_minutes END,
