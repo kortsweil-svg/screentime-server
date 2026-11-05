@@ -225,7 +225,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-05-missing' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-05-missing2' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1428,7 +1428,10 @@ app.post('/api/ios-day-code', auth, async (req, res) => {
       INSERT INTO reports_history (id, student_id, platform, report_date, synced_at, goal_hours, day_minutes)
       VALUES ($1,$2,'ios',$3,$4,$5,$6)
       ON CONFLICT (student_id, report_date) DO UPDATE SET
-        day_minutes = CASE WHEN reports_history.locked THEN reports_history.day_minutes ELSE EXCLUDED.day_minutes END,
+        -- תיקון של המורה (נעול עם זמן) נשאר; יום נעול ריק מתמלא מהקוד ונפתח
+        day_minutes = CASE WHEN reports_history.locked AND reports_history.day_minutes IS NOT NULL
+                           THEN reports_history.day_minutes ELSE EXCLUDED.day_minutes END,
+        locked = reports_history.locked AND reports_history.day_minutes IS NOT NULL,
         goal_hours = COALESCE(reports_history.goal_hours, EXCLUDED.goal_hours)
     `, [genId(), req.session.user_id, date, new Date().toISOString(), goalHours, stored]);
     console.log(`[ios-day-code] ${req.session.user_id} ${date} ${minutes}m`);
