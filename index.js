@@ -68,6 +68,7 @@ async function initDB() {
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS push_status TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS push_sent_at TIMESTAMP;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS sync_source TEXT;
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS missing_ok BOOLEAN;   -- האפליקציה יודעת לדווח יום חסר בקוד
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS app_version TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS goal_hours NUMERIC;
     -- דקות השימוש של אותו יום בלבד. total_minutes הוא שעות מצטברות
@@ -224,7 +225,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-03-ties' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-05-missing' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1044,18 +1045,24 @@ function saturdaysIn(ym) {
 }
 function trophyNeed(ym) { return saturdaysIn(ym); }   // כוכב בכל שבוע של החודש
 function starTypeFor(g) { return g === 3 ? 'gold' : g === 4 ? 'silver' : g === 5 ? 'bronze' : g >= 6 ? 'basic' : null; }
-function computeAchievements(rows, currentGoal, today, yearWindow) {
+function computeAchievements(rows, currentGoal, today, yearWindow, missing) {
   const days = {};
   for (const r of rows) if (r.minutes != null) days[r.date] = { minutes: r.minutes, goal: r.goal || currentGoal || null };
   // דקה אחת של סובלנות: באייפון יום נשמר עם דקה נוספת (0 ≠ "אין נתון"), ולכן 3:00 נשמר כ-3:01.
   const met = d => d && d.goal ? d.minutes <= d.goal * 60 + 1 : null;
+  const firstDay = Object.keys(days).sort()[0] || today;
 
-  // רצף
+  // רצף. יום חסר (לא נמדד ולא דווח בקוד) שובר את הרצף אחרי MISSING_GRACE ימים -
+  // חוץ משבת, ימים שבהם רוב הישיבה בלי נתונים (חג), וימים לפני תחילת הכלל.
   let streak = 0;
   for (let i = 1; i <= 400; i++) {
-    const d = days[isoAdd(today, -i)];
+    const iso = isoAdd(today, -i);
+    const d = days[iso];
     const m = met(d);
-    if (m === null) continue;
+    if (m === null) {
+      if (!d && missing && i > MISSING_GRACE && isRequiredDay(iso, missing.offDays, firstDay)) break;
+      continue;
+    }
     if (m) streak++; else break;
   }
 
@@ -1337,6 +1344,98 @@ app.get('/api/my-achievements-history', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── יום חסר באייפון: דיווח בקוד מהכרטיס של אפל (6.80 Build 84+) ─────────────
+// כשהטלפון כבוי בשעות המדידה (23:30 / 00:01), היום לא נמדד. הכרטיס של אפל כן
+// רואה ימים קודמים, ומציג את הזמן עם קוד: 4 ספרות זמן + 4 ספרות חתימה
+// (HMAC של התאריך, הזמן והחיבור של התלמיד). אי אפשר להמציא קוד.
+const MISSING_SECRET = 'kurz-missing-2026-Qx7';
+const MISSING_GRACE = 2;                 // ימים לדווח (אחריהם היום שובר את הרצף)
+const MISSING_RULE_START = '2026-11-08'; // הכלל חל מיום זה והלאה
+const OFF_DAY_RATIO = 0.3;               // פחות מ-30% מהתלמידים עם נתונים = חג/יום חופש
+function missingCheck(date, minutes, token) {
+  return crypto.createHmac('sha256', MISSING_SECRET).update(`${date}|${minutes}|${token}`).digest().readUInt32BE(0) % 10000;
+}
+function isRequiredDay(iso, offDays, firstDay, anyDate) {
+  return (anyDate || iso >= MISSING_RULE_START) && iso >= firstDay
+    && new Date(iso + 'T12:00:00Z').getUTCDay() !== 6 && !offDays.has(iso);
+}
+// ימים שבהם לרוב התלמידים של המורה אין נתונים (חגים, ימי חופש)
+async function schoolOffDays(teacherId, from) {
+  const tot = await pool.query(`SELECT count(*)::int AS n FROM students WHERE teacher_id=$1 AND COALESCE(active, TRUE)`, [teacherId]);
+  const total = tot.rows[0]?.n || 0;
+  const r = await pool.query(`
+    SELECT h.report_date::date::text AS d, count(DISTINCT h.student_id)::int AS n
+    FROM reports_history h JOIN students s ON s.id = h.student_id
+    WHERE s.teacher_id = $1 AND h.day_minutes IS NOT NULL AND h.report_date::date >= $2::date
+    GROUP BY 1`, [teacherId, from]);
+  const have = {}; for (const x of r.rows) have[x.d] = x.n;
+  const off = new Set();
+  for (let d = from; d < new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' }); d = isoAdd(d, 1))
+    if (!total || (have[d] || 0) < total * OFF_DAY_RATIO) off.add(d);
+  return off;
+}
+// הכלל חל רק על מי שהאפליקציה שלו יודעת לדווח יום חסר (אייפון Build 84+).
+async function missingContext(studentId, today) {
+  const ok = await pool.query('SELECT missing_ok FROM reports WHERE student_id=$1', [studentId]);
+  if (!ok.rows[0]?.missing_ok) return undefined;
+  const me = await pool.query('SELECT teacher_id FROM students WHERE id=$1', [studentId]);
+  const from = isoAdd(today, -60);
+  return { offDays: me.rows.length ? await schoolOffDays(me.rows[0].teacher_id, from) : new Set() };
+}
+
+// ימים חסרים שעוד אפשר לדווח (עד 7 ימים אחורה)
+app.get('/api/missing-days', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+    const from = isoAdd(today, -7);
+    await pool.query('UPDATE reports SET missing_ok = TRUE WHERE student_id=$1 AND missing_ok IS NOT TRUE', [req.session.user_id]);
+    const h = await pool.query(`SELECT report_date::date::text AS d FROM reports_history
+      WHERE student_id=$1 AND day_minutes IS NOT NULL`, [req.session.user_id]);
+    const have = new Set(h.rows.map(x => x.d));
+    const first = [...have].sort()[0];
+    if (!first) return res.json({ ok: true, days: [], grace: MISSING_GRACE });
+    const { offDays } = (await missingContext(req.session.user_id, today)) || { offDays: new Set() };
+    const days = [];
+    for (let d = from; d < today; d = isoAdd(d, 1))
+      if (!have.has(d) && isRequiredDay(d, offDays, first, true)) days.push({ date: d, deadline: isoAdd(d, MISSING_GRACE) });
+    res.json({ ok: true, days, grace: MISSING_GRACE });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+const missingTries = new Map();   // student|date -> ניסיונות היום
+app.post('/api/ios-day-code', auth, async (req, res) => {
+  if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
+  try {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+    const date = String(req.body.date || '');
+    const m = String(req.body.code || '').replace(/\D/g, '').match(/^(\d{4})(\d{4})$/);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date >= today || date < isoAdd(today, -7))
+      return res.status(400).json({ error: 'אפשר לדווח רק על 7 הימים האחרונים' });
+    if (!m) return res.status(400).json({ error: 'הקוד צריך להיות 8 ספרות' });
+    const key = req.session.user_id + '|' + today;
+    const tries = (missingTries.get(key) || 0) + 1;
+    missingTries.set(key, tries);
+    if (tries > 8) return res.status(429).json({ error: 'יותר מדי ניסיונות היום. נסה מחר.' });
+    const minutes = parseInt(m[1], 10), check = parseInt(m[2], 10);
+    const token = req.headers['authorization']?.replace('Bearer ', '') || '';
+    if (minutes > 1440 || missingCheck(date, minutes, token) !== check)
+      return res.status(400).json({ error: 'הקוד לא נכון. ודא שהעתקת את הקוד מהכרטיס.' });
+    const goalMinutes = parseInt(req.body.goalMinutes);
+    const goalHours = Number.isFinite(goalMinutes) && goalMinutes > 0 ? goalMinutes / 60 : null;
+    const stored = minutes >= 15 ? minutes + 1 : minutes;
+    await pool.query(`
+      INSERT INTO reports_history (id, student_id, platform, report_date, synced_at, goal_hours, day_minutes)
+      VALUES ($1,$2,'ios',$3,$4,$5,$6)
+      ON CONFLICT (student_id, report_date) DO UPDATE SET
+        day_minutes = CASE WHEN reports_history.locked THEN reports_history.day_minutes ELSE EXCLUDED.day_minutes END,
+        goal_hours = COALESCE(reports_history.goal_hours, EXCLUDED.goal_hours)
+    `, [genId(), req.session.user_id, date, new Date().toISOString(), goalHours, stored]);
+    console.log(`[ios-day-code] ${req.session.user_id} ${date} ${minutes}m`);
+    res.json({ ok: true, date, minutes });
+  } catch (e) { console.error('[ios-day-code]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/my-achievements', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   try {
@@ -1349,7 +1448,7 @@ app.get('/api/my-achievements', auth, async (req, res) => {
     `, [req.session.user_id, today]);
     const rows = h.rows.map(r => ({ date: r.date, minutes: Number(r.minutes), goal: r.goal != null ? Number(r.goal) : null }));
     const goal = g.rows[0]?.goal_hours != null ? Number(g.rows[0].goal_hours) : null;
-    res.json({ ok: true, today, ...computeAchievements(rows, goal, today) });
+    res.json({ ok: true, today, ...computeAchievements(rows, goal, today, undefined, await missingContext(req.session.user_id, today)) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
