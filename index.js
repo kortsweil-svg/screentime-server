@@ -227,7 +227,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-05-appbuild' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-06-broadcast' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1683,6 +1683,53 @@ function buildAfternoonAlert(student) {
     },
   };
 }
+
+// ─── הודעה חד-פעמית לתלמידים (מהלוח, רק בעל החשבון) ─────────────────────────
+// platform: ios / android / all. dryRun = רק לספור כמה יקבלו.
+const lastBroadcast = new Map();   // teacher -> זמן שליחה אחרונה (מניעת שליחה כפולה)
+app.post('/api/teacher/broadcast', auth, teacherOnly, async (req, res) => {
+  if (req.session.user_id !== req.session.teacher_id)
+    return res.status(403).json({ error: 'רק בעל החשבון יכול לשלוח הודעה לכולם' });
+  const title = String(req.body.title || '').trim().slice(0, 60);
+  const body = String(req.body.body || '').trim().slice(0, 300);
+  const platform = ['ios', 'android'].includes(req.body.platform) ? req.body.platform : null;
+  try {
+    const r = await pool.query(`
+      SELECT s.id, s.fcm_token FROM students s JOIN reports rp ON rp.student_id = s.id
+      WHERE s.teacher_id = $1 AND s.fcm_token IS NOT NULL AND COALESCE(s.active, TRUE)
+        AND ($2::text IS NULL OR rp.platform = $2)`, [req.session.teacher_id, platform]);
+    const tokens = [...new Map(r.rows.map(x => [x.fcm_token, x.id])).entries()];
+    if (req.body.dryRun) return res.json({ ok: true, count: tokens.length });
+    if (!title || !body) return res.status(400).json({ error: 'חסרים כותרת או תוכן' });
+    if (!firebaseReady) return res.status(503).json({ error: 'שירות ההתראות לא זמין כרגע' });
+    const last = lastBroadcast.get(req.session.teacher_id) || 0;
+    if (Date.now() - last < 2 * 60 * 1000) return res.status(429).json({ error: 'נשלחה הודעה לפני פחות מ-2 דקות' });
+    lastBroadcast.set(req.session.teacher_id, Date.now());
+    let sent = 0, failed = 0; const invalid = [];
+    for (const [token, id] of tokens) {
+      try {
+        await admin.messaging().send({
+          token,
+          notification: { title, body },
+          data: { type: 'broadcast' },   // סוג לא מוכר לאפליקציה - לא מפעיל סנכרון
+          android: { priority: 'high', ttl: 24 * 60 * 60 * 1000 },
+          apns: {
+            headers: { 'apns-priority': '10', 'apns-push-type': 'alert',
+                       'apns-expiration': String(Math.floor(Date.now() / 1000) + 24 * 60 * 60) },
+            payload: { aps: { sound: 'default' } },
+          },
+        });
+        sent++;
+      } catch (e) {
+        failed++;
+        if (e.code === 'messaging/registration-token-not-registered' || e.code === 'messaging/invalid-registration-token') invalid.push(id);
+      }
+    }
+    if (invalid.length) await pool.query('UPDATE students SET fcm_token=NULL WHERE id = ANY($1)', [invalid]);
+    console.log(`[broadcast] teacher=${req.session.teacher_id} platform=${platform || 'all'} sent=${sent} failed=${failed}`);
+    res.json({ ok: true, sent, failed });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 function buildMorningAlert(student) {
   const cheer = MORNING_CHEERS[Math.floor(Math.random() * MORNING_CHEERS.length)];
