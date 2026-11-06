@@ -71,6 +71,7 @@ async function initDB() {
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS missing_ok BOOLEAN;   -- האפליקציה יודעת לדווח יום חסר בקוד
     ALTER TABLE reports_history ADD COLUMN IF NOT EXISTS source TEXT;   -- 'code' = דווח בקוד מהכרטיס
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS app_version TEXT;
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS app_build TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS goal_hours NUMERIC;
     -- דקות השימוש של אותו יום בלבד. total_minutes הוא שעות מצטברות
     -- ו-daily_average הוא ממוצע שבועי, אז אף אחד מהם לא מתאים לשחזור
@@ -226,7 +227,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-05-codemark' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-05-appbuild' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -665,7 +666,7 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
     const weekStart = ws.toISOString().slice(0, 10);
     const st = await pool.query(`
       SELECT s.id, s.name, s.class_name, s.consent, s.active, (s.fcm_token IS NOT NULL) AS has_push,
-             r.goal_hours, r.platform, r.synced_at, r.app_version, r.nav_excluded,
+             r.goal_hours, r.platform, r.synced_at, r.app_version, r.app_build, r.nav_excluded,
              g.days_met, g.days_reported, g.goal_rank, g.group_size
       FROM students s
       LEFT JOIN reports r ON r.student_id = s.id
@@ -702,6 +703,7 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
         platform: s.platform || null,
         lastSync: s.synced_at || null,
         appVersion: s.app_version || null,
+        appBuild: s.app_build || null,
         // פוש: יש מזהה רק אם התלמיד אישר התראות (בלי אישור האפליקציה לא נרשמת)
         hasPush: !!s.has_push,
         // ניכוי ניווט ותפילה: אנדרואיד 6.68+ אוטומטי; אייפון - רק מה שהאפליקציה דיווחה (6.70+)
@@ -830,6 +832,7 @@ app.post('/api/report', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   // גרסאות ישנות שולחות גם שדות שכבר לא נשמרים (ציון, רצף, ממוצעים) - מתעלמים מהם.
   const { consent, platform, syncedAt, pushStatus, pushSentAt, syncSource, appVersion, goalHours, dayMinutes } = req.body;
+  const appBuild = req.body.appBuild && req.body.appBuild !== '0' ? String(req.body.appBuild).slice(0, 10) : null;
   // iOS 6.70+: האם התלמיד הפעיל (ואימת) את ניכוי הניווט והתפילה
   const hasNav = typeof req.body.navExcluded === 'boolean';
   // יעד נשמר רק כשהדיווח שלח אותו. גרסה ישנה מאוד בלי השדה לא תמחק יעד קיים.
@@ -842,11 +845,14 @@ app.post('/api/report', auth, async (req, res) => {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       ON CONFLICT (student_id) DO UPDATE SET
         consent=$2, platform=$3, synced_at=$4, push_status=$5, push_sent_at=$6, sync_source=$7, app_version=$8,
-        goal_hours=CASE WHEN $10 THEN $9 ELSE reports.goal_hours END
+        goal_hours=CASE WHEN $10 THEN $9 ELSE reports.goal_hours END,
+        -- מספר בנייה: מהדיווח; דיווח בלי מספר (סנכרון ברקע ישן) שומר את הקודם אם הגרסה לא השתנתה
+        app_build=CASE WHEN $11::text IS NOT NULL THEN $11::text
+                       WHEN reports.app_version IS NOT DISTINCT FROM $8 THEN reports.app_build ELSE NULL END
     `, [req.session.user_id, JSON.stringify(consent || {}), platform || 'unknown',
         syncedAt || new Date().toISOString(),
         pushStatus || null, pushSentAt || null, syncSource || null, appVersion || null,
-        goalHours ?? null, hasGoal]);
+        goalHours ?? null, hasGoal, appBuild]);
     if (hasNav) await pool.query('UPDATE reports SET nav_excluded=$1 WHERE student_id=$2', [req.body.navExcluded, req.session.user_id]);
 
     // היסטוריה יומית - תאריך לפי שעון ישראל.
