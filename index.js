@@ -227,7 +227,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-06-broadcast' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-08-lastsync' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -666,7 +666,12 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
     const weekStart = ws.toISOString().slice(0, 10);
     const st = await pool.query(`
       SELECT s.id, s.name, s.class_name, s.consent, s.active, (s.fcm_token IS NOT NULL) AS has_push,
-             r.goal_hours, r.platform, r.synced_at, r.app_version, r.app_build, r.nav_excluded,
+             r.goal_hours, r.platform, r.app_version, r.app_build, r.nav_excluded,
+             -- סנכרון אחרון: גם פתיחת האפליקציה וגם מדידה לילית שנשלחה מהטלפון (בלי לפתוח אותו)
+             GREATEST(r.synced_at::timestamptz,
+                      (SELECT max(h2.synced_at::timestamptz) FROM reports_history h2
+                        WHERE h2.student_id = s.id AND h2.day_minutes IS NOT NULL
+                          AND COALESCE(h2.platform, '') <> 'manual')) AS synced_at,
              g.days_met, g.days_reported, g.goal_rank, g.group_size
       FROM students s
       LEFT JOIN reports r ON r.student_id = s.id
