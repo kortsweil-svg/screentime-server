@@ -227,7 +227,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-08-allmissing' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-08-back21' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1418,7 +1418,8 @@ app.get('/api/my-achievements-history', auth, async (req, res) => {
 // רואה ימים קודמים, ומציג את הזמן עם קוד: 4 ספרות זמן + 4 ספרות חתימה
 // (HMAC של התאריך, הזמן והחיבור של התלמיד). אי אפשר להמציא קוד.
 const MISSING_SECRET = 'kurz-missing-2026-Qx7';
-const MISSING_GRACE = 2;                 // ימים לדווח (אחריהם היום שובר את הרצף)
+const MISSING_GRACE = 2;
+const MISSING_DAYS_BACK = 21;            // כמה ימים אחורה אפשר להשלים                 // ימים לדווח (אחריהם היום שובר את הרצף)
 const MISSING_RULE_START = '2026-11-08'; // הכלל חל מיום זה והלאה
 const OFF_DAY_RATIO = 0.3;               // פחות מ-30% מהתלמידים עם נתונים = חג/יום חופש
 function missingCheck(date, minutes, token) {
@@ -1458,7 +1459,7 @@ app.get('/api/missing-days', auth, async (req, res) => {
   if (req.session.role !== 'student') return res.status(403).json({ error: 'אין הרשאה' });
   try {
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
-    const from = isoAdd(today, -7);
+    const from = isoAdd(today, -MISSING_DAYS_BACK);
     await pool.query('UPDATE reports SET missing_ok = TRUE WHERE student_id=$1 AND missing_ok IS NOT TRUE', [req.session.user_id]);
     const h = await pool.query(`SELECT report_date::date::text AS d FROM reports_history
       WHERE student_id=$1 AND day_minutes IS NOT NULL`, [req.session.user_id]);
@@ -1466,10 +1467,14 @@ app.get('/api/missing-days', auth, async (req, res) => {
     const first = [...have].sort()[0];
     if (!first) return res.json({ ok: true, days: [], grace: MISSING_GRACE });
     const { offDays } = (await missingContext(req.session.user_id, today)) || { offDays: new Set() };
-    // כל יום שלא נמדד (גם שבת וחג) מקבל כרטיס השלמה - חובה.
+    // כל יום שלא נמדד (גם שבת וחג) מקבל כרטיס השלמה - חובה. החדש ביותר קודם.
+    // יום שהמועד שלו כבר עבר: "עד היום" (דיווח מאוחר עדיין משלים את היום).
     const days = [];
-    for (let d = from; d < today; d = isoAdd(d, 1))
-      if (!have.has(d) && d >= first) days.push({ date: d, deadline: isoAdd(d, MISSING_GRACE) });
+    for (let d = isoAdd(today, -1); d >= from; d = isoAdd(d, -1))
+      if (!have.has(d) && d >= first) {
+        const dl = isoAdd(d, MISSING_GRACE);
+        days.push({ date: d, deadline: dl < today ? today : dl });
+      }
     res.json({ ok: true, days, grace: MISSING_GRACE });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1481,8 +1486,8 @@ app.post('/api/ios-day-code', auth, async (req, res) => {
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
     const date = String(req.body.date || '');
     const m = String(req.body.code || '').replace(/\D/g, '').match(/^(\d{4})(\d{4})$/);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date >= today || date < isoAdd(today, -7))
-      return res.status(400).json({ error: 'אפשר לדווח רק על 7 הימים האחרונים' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date >= today || date < isoAdd(today, -MISSING_DAYS_BACK))
+      return res.status(400).json({ error: `אפשר לדווח רק על ${MISSING_DAYS_BACK} הימים האחרונים` });
     if (!m) return res.status(400).json({ error: 'הקוד צריך להיות 8 ספרות' });
     const key = req.session.user_id + '|' + today;
     const tries = (missingTries.get(key) || 0) + 1;
@@ -1492,6 +1497,8 @@ app.post('/api/ios-day-code', auth, async (req, res) => {
     const token = req.headers['authorization']?.replace('Bearer ', '') || '';
     if (minutes > 1440 || missingCheck(date, minutes, token) !== check)
       return res.status(400).json({ error: 'הקוד לא נכון. ודא שהעתקת את הקוד מהכרטיס.' });
+    // 0 דקות = לאפל אין נתונים על היום (למשל יום ישן מדי). לא נקלט, כדי שלא ייחשב "ביעד" בטעות.
+    if (minutes === 0) return res.status(400).json({ error: 'אין לאפל נתונים על היום הזה. פנה למורה.' });
     const goalMinutes = parseInt(req.body.goalMinutes);
     const goalHours = Number.isFinite(goalMinutes) && goalMinutes > 0 ? goalMinutes / 60 : null;
     const stored = minutes >= 15 ? minutes + 1 : minutes;
