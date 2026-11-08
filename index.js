@@ -227,7 +227,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-08-lastsync' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-08-reply' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -430,6 +430,30 @@ app.post('/api/teacher/support/:id/handled', auth, teacherOnly, async (req, res)
       [req.body.handled !== false, req.params.id, req.session.teacher_id]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// תשובה לפונה: התראה לטלפון של התלמיד (דרך מערכת ההתראות הקיימת), והפנייה מסומנת כטופלה
+app.post('/api/teacher/support/:id/reply', auth, teacherOnly, async (req, res) => {
+  const text = String(req.body.text || '').trim().slice(0, 300);
+  if (!text) return res.status(400).json({ error: 'חסר תוכן' });
+  try {
+    const r = await pool.query(`SELECT s.fcm_token, s.name FROM support_messages m JOIN students s ON s.id = m.student_id
+      WHERE m.id = $1 AND m.teacher_id = $2`, [req.params.id, req.session.teacher_id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'הפנייה לא נמצאה' });
+    if (!r.rows[0].fcm_token) return res.status(400).json({ error: 'לתלמיד אין התראות פעילות. אפשר לענות בוואטסאפ.' });
+    if (!firebaseReady) return res.status(503).json({ error: 'שירות ההתראות לא זמין כרגע' });
+    await admin.messaging().send({
+      token: r.rows[0].fcm_token,
+      notification: { title: 'תשובה לפנייה שלך 💬', body: text },
+      data: { type: 'support_reply' },
+      android: { priority: 'high', ttl: 24 * 60 * 60 * 1000 },
+      apns: { headers: { 'apns-priority': '10', 'apns-push-type': 'alert',
+                         'apns-expiration': String(Math.floor(Date.now() / 1000) + 24 * 60 * 60) },
+              payload: { aps: { sound: 'default' } } },
+    });
+    await pool.query('UPDATE support_messages SET handled = TRUE WHERE id = $1 AND teacher_id = $2', [req.params.id, req.session.teacher_id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.code === 'messaging/registration-token-not-registered' ? 'האפליקציה הוסרה מהטלפון של התלמיד' : e.message }); }
 });
 
 // יומן הכניסות והצפיות בלוח (60 הימים האחרונים, עד 100 רשומות)
