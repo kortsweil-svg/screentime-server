@@ -227,7 +227,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-08-reply' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-08-allmissing' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1260,9 +1260,41 @@ app.get('/api/rank-board', auth, async (req, res) => {
     }
     // ─── התצוגה עצמה, מוכנה לציור (6.80+). שינוי כאן לא דורש עדכון גרסה ───
     const MEDAL = { 1: '🥇', 2: '🥈', 3: '🥉' };
-    const rows = podium.map(p => ({ icon: MEDAL[p.rank], title: p.me ? `${p.name} (אתה)` : p.name, sub: p.cls, value: fmtP(p.points), hl: p.me }));
-    if (mine && !podium.some(p => p.me)) {
-      if (rank > (podium.length ? podium[podium.length - 1].rank : 0) + 1) rows.push({ gap: true });
+    // מקומות 1-3, תלמידים בתיקו מאוחדים בשורה אחת (כמו באולימפיאדה: שני ראשונים -> אין שני, יש שלישי).
+    // רק מי שיש לו נקודות; עד 4 שמות בשורה ואז "ועוד N".
+    const groups = [];
+    for (const x of list) {
+      const rk = 1 + list.filter(y => y.p > x.p).length;
+      if (rk > 3 || x.p <= 0) break;
+      let g = groups.find(q => q.rank === rk);
+      if (!g) groups.push(g = { rank: rk, points: x.p, people: [] });
+      g.people.push({ name: who[x.id]?.name || '', cls: who[x.id]?.cls || null, me: x.id === selfId });
+    }
+    // v=2 (Build 86+): שורה לכל מקום עם נציג אחד - אני, או תלמיד מהכיתה שלי - ו"ועוד N"
+    // שנפתח לרשימת כל השותפים. בניות קודמות: כל השמות בשורה (עד 4).
+    const v2 = Number(req.query.v) >= 2;
+    const rows = groups.map(g => {
+      const ppl = [...g.people];
+      const many = ppl.length > 1;
+      if (v2) {
+        const rep = ppl.find(p => p.me) || ppl.find(p => p.cls === class_name) || ppl[0];
+        const others = ppl.filter(p => p !== rep).map(p => ({ name: p.name, cls: scope === 'class' ? null : p.cls }));
+        const sub = [scope === 'class' ? null : rep.cls, many ? `${ppl.length} תלמידים בתיקו` : null].filter(Boolean).join(' · ') || null;
+        return { icon: MEDAL[g.rank], title: rep.me ? `${rep.name} (אתה)` : rep.name, sub,
+                 more: others.length ? `ועוד ${others.length}` : undefined, others: others.length ? others : undefined,
+                 value: fmtP(g.points), hl: rep.me };
+      }
+      ppl.sort((a, b) => b.me - a.me);   // אני ראשון בשורה
+      // שורה אחת באפליקציה: ב-3 שמות ומעלה - שם פרטי ואות ראשונה של המשפחה
+      const short = n => { const w = String(n).trim().split(/\s+/); return w.length > 1 ? `${w[0]} ${w[w.length - 1][0]}'` : w[0]; };
+      const names = ppl.slice(0, 4).map(p => { const n = ppl.length >= 3 ? short(p.name) : p.name; return p.me ? `${n} (אתה)` : n; });
+      const more = ppl.length - names.length;
+      const sub = many ? `${ppl.length} תלמידים בתיקו` : scope === 'class' ? null : ppl[0].cls;
+      return { icon: MEDAL[g.rank], title: names.join(' · ') + (more > 0 ? ` ועוד ${more}` : ''), sub,
+               value: fmtP(g.points), hl: ppl.some(p => p.me) };
+    });
+    if (mine && !rows.some(r => r.hl)) {
+      if (rank > (groups.length ? groups[groups.length - 1].rank : 0) + 1) rows.push({ gap: true });
       rows.push({ rank: String(rank), title: 'אני', value: fmtP(mine.p), hl: true });
     }
     // תיקו: כמה תלמידים חולקים איתי את אותו ניקוד (למשל כולם עם 0 נקודות)
@@ -1392,9 +1424,10 @@ const OFF_DAY_RATIO = 0.3;               // פחות מ-30% מהתלמידים �
 function missingCheck(date, minutes, token) {
   return crypto.createHmac('sha256', MISSING_SECRET).update(`${date}|${minutes}|${token}`).digest().readUInt32BE(0) % 10000;
 }
+// יום שבלי דיווח שובר את הרצף: כל יום (גם שבת), חוץ מימים שבהם לרוב הישיבה אין נתונים
+// (חג של כמה ימים, שבו הטלפונים כבויים גם בזמן ההשלמה).
 function isRequiredDay(iso, offDays, firstDay, anyDate) {
-  return (anyDate || iso >= MISSING_RULE_START) && iso >= firstDay
-    && new Date(iso + 'T12:00:00Z').getUTCDay() !== 6 && !offDays.has(iso);
+  return (anyDate || iso >= MISSING_RULE_START) && iso >= firstDay && !offDays.has(iso);
 }
 // ימים שבהם לרוב התלמידים של המורה אין נתונים (חגים, ימי חופש)
 async function schoolOffDays(teacherId, from) {
@@ -1433,9 +1466,10 @@ app.get('/api/missing-days', auth, async (req, res) => {
     const first = [...have].sort()[0];
     if (!first) return res.json({ ok: true, days: [], grace: MISSING_GRACE });
     const { offDays } = (await missingContext(req.session.user_id, today)) || { offDays: new Set() };
+    // כל יום שלא נמדד (גם שבת וחג) מקבל כרטיס השלמה - חובה.
     const days = [];
     for (let d = from; d < today; d = isoAdd(d, 1))
-      if (!have.has(d) && isRequiredDay(d, offDays, first, true)) days.push({ date: d, deadline: isoAdd(d, MISSING_GRACE) });
+      if (!have.has(d) && d >= first) days.push({ date: d, deadline: isoAdd(d, MISSING_GRACE) });
     res.json({ ok: true, days, grace: MISSING_GRACE });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
