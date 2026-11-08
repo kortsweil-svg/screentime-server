@@ -70,6 +70,7 @@ async function initDB() {
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS sync_source TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS missing_ok BOOLEAN;   -- האפליקציה יודעת לדווח יום חסר בקוד
     ALTER TABLE reports_history ADD COLUMN IF NOT EXISTS source TEXT;   -- 'code' = דווח בקוד מהכרטיס
+    ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS reply_phone TEXT;   -- וואטסאפ של התלמיד לתשובה (לא חובה)
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS app_version TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS app_build TEXT;
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS goal_hours NUMERIC;
@@ -227,7 +228,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-08-back21' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-08-replyphone' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -360,11 +361,12 @@ app.post('/api/support', auth, async (req, res) => {
     const st = await pool.query('SELECT teacher_id FROM students WHERE id=$1', [req.session.user_id]);
     const diag = req.body.diag ? JSON.stringify(req.body.diag).slice(0, 30000) : null;
     await pool.query(
-      `INSERT INTO support_messages (student_id, teacher_id, text, platform, app_version, os_version, diag)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      `INSERT INTO support_messages (student_id, teacher_id, text, platform, app_version, os_version, diag, reply_phone)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [req.session.user_id, st.rows[0]?.teacher_id || null, text,
        String(req.body.platform || '').slice(0, 20), String(req.body.appVersion || '').slice(0, 20),
-       String(req.body.osVersion || '').slice(0, 20), diag]);
+       String(req.body.osVersion || '').slice(0, 20), diag,
+       String(req.body.replyPhone || '').replace(/[^\d+]/g, '').slice(0, 15) || null]);
     console.log(`[support] new message from ${req.session.user_id}`);
     // מספר וואטסאפ לפניות (אם המורה הגדיר) - האפליקציה מציעה לשלוח אליו צילום מסך
     const ph = await pool.query('SELECT support_phone FROM teachers WHERE id=$1', [st.rows[0]?.teacher_id || null]);
@@ -416,7 +418,7 @@ app.post('/api/teacher/day', auth, teacherOnly, async (req, res) => {
 app.get('/api/teacher/support', auth, teacherOnly, async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT m.id, m.text, m.platform, m.app_version, m.os_version, m.diag, m.handled, m.created_at,
+      SELECT m.id, m.text, m.platform, m.app_version, m.os_version, m.diag, m.handled, m.created_at, m.reply_phone,
              s.name, s.class_name
       FROM support_messages m LEFT JOIN students s ON s.id = m.student_id
       WHERE m.teacher_id = $1
@@ -1156,9 +1158,29 @@ function computeAchievements(rows, currentGoal, today, yearWindow, missing) {
 }
 
 // ─── ניקוד משוקלל ודירוג מול כולם (כיתה / שכבה / כל הישיבה) ─────────────────────────
-// יום ביעד: 3ש' = 1.75 נק', 4ש' = 1.5, 5ש' = 1, 6ש' ומעלה = 0.5.
+// יום ביעד (להבה): 3ש' = 20 נק', 4ש' = 15, 5ש' = 10, 6ש' ומעלה = 5.
 // "נקודות הצלה": חריגה עד חצי שעה = חצי מהנקודות, עד שעה = רבע, מעבר לזה = 0.
-function goalWeight(g) { return g <= 3 ? 1.75 : g <= 4 ? 1.5 : g <= 5 ? 1 : 0.5; }
+function goalWeight(g) { return g <= 3 ? 20 : g <= 4 ? 15 : g <= 5 ? 10 : 5; }
+// בונוסים שבועיים (שבוע ראשון-שבת שהסתיים): כוכב (5 ימים ביעד) = 20, שבוע מלא (7 להבות) = 20 נוספות
+const STAR_BONUS = 20, FULL_WEEK_BONUS = 20;
+const weekStartOf = iso => isoAdd(iso, -new Date(iso + 'T12:00:00Z').getUTCDay());
+// בונוסים לשבועות שהשבת שלהם בטווח [from, to] (שבוע שעוד לא נגמר - בלי בונוס)
+function weekBonuses(days, from, to) {
+  // days: { 'YYYY-MM-DD': { minutes, goal } }
+  let bonus = 0;
+  for (let sun = weekStartOf(from); sun <= to; sun = isoAdd(sun, 7)) {
+    const sat = isoAdd(sun, 6);
+    if (sat < from || sat > to) continue;
+    let met = 0;
+    for (let i = 0; i < 7; i++) {
+      const d = days[isoAdd(sun, i)];
+      if (d && d.goal && d.minutes <= d.goal * 60 + 1) met++;
+    }
+    if (met >= 5) bonus += STAR_BONUS;
+    if (met === 7) bonus += FULL_WEEK_BONUS;
+  }
+  return bonus;
+}
 function dayPoints(minutes, goalHours) {
   if (!goalHours || goalHours <= 0 || minutes == null) return 0;
   const w = goalWeight(goalHours), over = minutes - goalHours * 60 - 1;   // דקת הסובלנות של אייפון
@@ -1197,24 +1219,28 @@ function rankRange(period, today, back = 0) {
 // רשימת דירוג לתקופה ולהיקף (כיתה/שכבה/ישיבה). התלמיד עצמו תמיד נספר, אחרים רק עם הסכמה.
 async function rankList(teacherId, className, scope, from, to, selfId) {
   const r = await pool.query(`
-    SELECT s.id, s.name, s.class_name, h.day_minutes AS m,
+    SELECT s.id, s.name, s.class_name, h.day_minutes AS m, h.report_date::date::text AS d,
            COALESCE(NULLIF(h.goal_hours::text, '')::numeric, NULLIF(rp.goal_hours::text, '')::numeric) AS g
     FROM students s
     JOIN reports_history h ON h.student_id = s.id
     LEFT JOIN reports rp ON rp.student_id = s.id
     WHERE s.teacher_id = $1
       AND ((s.consent = TRUE AND COALESCE(s.active, TRUE) = TRUE) OR s.id = $4)
-      AND h.day_minutes IS NOT NULL AND h.report_date::date BETWEEN $2::date AND $3::date
-  `, [teacherId, from, to, selfId]);
+      AND h.day_minutes IS NOT NULL AND h.report_date::date BETWEEN ($2::date - 6) AND $3::date
+  `, [teacherId, from, to, selfId]);   // 6 ימים אחורה: לשבוע שהשבת שלו בתחילת הטווח
   const inScope = c => scope === 'school' ? true
     : scope === 'grade' ? gradeOf(c) === gradeOf(className) : String(c || '') === String(className || '');
-  const pts = {}, days = {}, who = {};
+  const pts = {}, days = {}, who = {}, byDay = {};
   for (const row of r.rows) {
     if (!inScope(row.class_name)) continue;
+    const d = String(row.d), g = row.g != null ? Number(row.g) : null;
+    (byDay[row.id] = byDay[row.id] || {})[d] = { minutes: Number(row.m), goal: g };
+    if (d < from) continue;   // ימים שלפני הטווח - רק לחישוב בונוס השבוע
     who[row.id] = { name: row.name, cls: row.class_name };
-    pts[row.id] = (pts[row.id] || 0) + dayPoints(Number(row.m), row.g != null ? Number(row.g) : null);
+    pts[row.id] = (pts[row.id] || 0) + dayPoints(Number(row.m), g);
     days[row.id] = (days[row.id] || 0) + 1;
   }
+  for (const id of Object.keys(pts)) pts[id] += weekBonuses(byDay[id], from, to);
   // id הוא מחרוזת hex (לא מספר), לכן משווים כמחרוזת
   const list = Object.entries(pts).map(([id, p]) => ({ id, p: Math.round(p * 100) / 100 })).sort((a, b) => b.p - a.p);
   return { list, who, days };
@@ -1225,7 +1251,7 @@ const fmtP = p => String(Math.round(p * 100) / 100);
 // הסבר הניקוד - נשלח מהשרת, כך שאפשר לשנות אותו בלי עדכון גרסה
 const RANK_INFO = {
   title: 'איך צוברים נקודות?',
-  text: 'כל יום ביעד מזכה בנקודות – ככל שהיעד מאתגר יותר, יותר נקודות:\nיעד 3 שעות: 1.75 · יעד 4: 1.5 · יעד 5: 1 · יעד 6: 0.5\nחרגת? לא נורא – עצור מהר:\nעד חצי שעה מעל היעד = חצי מהנקודות · עד שעה = רבע',
+  text: 'כל להבה (יום ביעד) – ככל שהיעד מאתגר יותר, יותר נקודות:\nיעד 3 שעות: 20 · יעד 4: 15 · יעד 5: 10 · יעד 6: 5\nכל כוכב: עוד 20 · שבוע שלם ברצף (7 להבות): עוד 20\nחרגת? לא נורא – עצור מהר:\nעד חצי שעה מעל היעד = חצי מהנקודות · עד שעה = רבע',
 };
 
 app.get('/api/rank-board', auth, async (req, res) => {
