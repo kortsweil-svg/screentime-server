@@ -228,7 +228,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-11-tiedots' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-12-tiedots2' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -1307,8 +1307,9 @@ app.get('/api/rank-board', auth, async (req, res) => {
         const others = ppl.filter(p => p !== rep).map(p => ({ name: p.name, cls: scope === 'class' ? null : p.cls }));
         // בתיקו: רק שלוש נקודות אחרי השם (הקשה פותחת את כל השותפים). השורה שלי מודגשת - בלי "(אתה)".
         const sub = scope === 'class' ? null : rep.cls;
-        return { icon: MEDAL[g.rank], title: rep.name, sub,
-                 more: others.length ? '...' : undefined, others: others.length ? others : undefined,
+        // הנקודות בתוך השם (לא בשדה more, שהאפליקציה מציגה עם קו תחתון). השורה עדיין לחיצה בזכות others.
+        return { icon: MEDAL[g.rank], title: others.length ? `${rep.name} ...` : rep.name, sub,
+                 others: others.length ? others : undefined,
                  value: fmtP(g.points), hl: rep.me };
       }
       ppl.sort((a, b) => b.me - a.me);   // אני ראשון בשורה
