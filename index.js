@@ -96,6 +96,23 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     );
     ALTER TABLE teachers ADD COLUMN IF NOT EXISTS support_phone TEXT;
+    -- מעבר שנה: הכיתה של כל תלמיד בכל שנת לימודים (year = שנת ההתחלה, למשל 2026 = תשפ"ז)
+    CREATE TABLE IF NOT EXISTS class_history (
+      student_id TEXT NOT NULL,
+      year INT NOT NULL,
+      class_name TEXT,
+      PRIMARY KEY (student_id, year)
+    );
+    CREATE TABLE IF NOT EXISTS year_transitions (
+      teacher_id TEXT NOT NULL,
+      year INT NOT NULL,                 -- השנה שהסתיימה
+      graduated TEXT[] DEFAULT '{}',     -- מסיימי י"ב שהושבתו (לביטול)
+      done_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (teacher_id, year)
+    );
+    -- כיתת ברירת מחדל בלוח, לכל משתמש (בעל החשבון / צוות)
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS default_class TEXT;
+    ALTER TABLE teacher_staff ADD COLUMN IF NOT EXISTS default_class TEXT;
     -- יום שהמורה תיקן בלוח: הטלפון לא דורס אותו יותר
     ALTER TABLE reports_history ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS support_messages (
@@ -228,7 +245,7 @@ function teacherOnly(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-12-tiedots2' }));   // לבדיקה שהגרסה עלתה
+app.get('/', (req, res) => res.json({ status: 'ok', build: '2026-11-12-yearmove' }));   // לבדיקה שהגרסה עלתה
 
 // ─── מורה: רישום ─────────────────────────────────────────────────────────────
 app.post('/api/teacher/register', async (req, res) => {
@@ -725,8 +742,17 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
       });
     }
     const sy = schoolYear(today);
+    // הכיתה בשנים קודמות (מעבר שנה) וכיתת ברירת המחדל של המשתמש
+    const ch = await pool.query(`SELECT h.student_id, h.year, h.class_name FROM class_history h
+      JOIN students s ON s.id = h.student_id WHERE s.teacher_id = $1`, [req.session.teacher_id]);
+    const classHist = {};
+    for (const r of ch.rows) (classHist[r.student_id] = classHist[r.student_id] || {})[r.year] = r.class_name;
+    const dc = req.session.user_id === req.session.teacher_id
+      ? await pool.query('SELECT default_class FROM teachers WHERE id=$1', [req.session.teacher_id])
+      : await pool.query('SELECT default_class FROM teacher_staff WHERE id=$1', [req.session.user_id]);
     res.json({
       today, weekStart, yearStart: sy.start, yearEnd: sy.end,
+      myDefaultClass: dc.rows[0]?.default_class || null,
       students: st.rows.map(s => ({
         id: s.id, name: s.name, className: s.class_name,
         consent: s.consent, active: s.active,
@@ -746,12 +772,88 @@ app.get('/api/teacher/overview', auth, teacherOnly, async (req, res) => {
         rank: s.goal_rank ?? null,
         groupSize: s.group_size ?? null,
         days: s.consent ? (byStudent[s.id] || []) : [],
+        classHistory: classHist[s.id] || undefined,   // { 2026: 'י׳1' } - הכיתה בשנה שהסתיימה
       })),
     });
   } catch (e) {
     console.error('[teacher/overview]', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ─── מעבר שנה ────────────────────────────────────────────────────────────────
+// ז→ח→ט→י→י"א→י"ב; מסיימי י"ב מושבתים (הנתונים נשמרים). לפני ההעלאה נשמרת הכיתה של
+// כל תלמיד בשנה שהסתיימה, כך שהשוואות של שנה קודמת מציגות את הכיתה של אותה שנה.
+const NEXT_GRADE = { 'ז': 'ח', 'ח': 'ט', 'ט': 'י', 'י': 'יא', 'יא': 'יב', 'יב': null };
+function nextClass(cls) {
+  const t = String(cls || '').replace(/["'״׳`’‘”“]/g, '').replace(/[\s\-_.\/]/g, '');
+  const m = t.match(/^([\u05D0-\u05EA]{1,3})(\d*)$/);
+  if (!m || !(m[1] in NEXT_GRADE)) return { ok: false };
+  const g = NEXT_GRADE[m[1]];
+  return g === null ? { ok: true, graduate: true } : { ok: true, cls: normClass(g + m[2]) };
+}
+// השנה שמסתיימת: בקיץ (יוני-אוגוסט) - השנה הנוכחית; בספטמבר-נובמבר - השנה שזה עתה הסתיימה
+function endingYear(today) {
+  const [y, m] = today.split('-').map(Number);
+  return m >= 9 ? (m <= 11 ? y - 1 : y) : y - 1;
+}
+app.post('/api/teacher/year-transition', auth, ownerOnly, async (req, res) => {
+  try {
+    const tid = req.session.teacher_id;
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+    const year = endingYear(today);
+    const heb = `תשפ"${['ה','ו','ז','ח','ט'][year - 2024] || '?'}`;   // 2026 = תשפ"ז
+    const done = await pool.query('SELECT graduated, done_at FROM year_transitions WHERE teacher_id=$1 AND year=$2', [tid, year]);
+    const st = await pool.query(`SELECT id, name, class_name FROM students WHERE teacher_id=$1 AND COALESCE(active, TRUE) ORDER BY class_name, name`, [tid]);
+
+    // ביטול: מחזירים את הכיתות מהשנה שנשמרה ומפעילים מחדש את המסיימים
+    if (req.body.undo) {
+      if (!done.rows.length) return res.status(400).json({ error: 'אין מעבר שנה לבטל' });
+      await pool.query(`UPDATE students s SET class_name = h.class_name FROM class_history h
+        WHERE h.student_id = s.id AND h.year = $2 AND s.teacher_id = $1`, [tid, year]);
+      await pool.query('UPDATE students SET active = TRUE WHERE teacher_id=$1 AND id = ANY($2)', [tid, done.rows[0].graduated || []]);
+      await pool.query('DELETE FROM year_transitions WHERE teacher_id=$1 AND year=$2', [tid, year]);
+      return res.json({ ok: true, undone: true });
+    }
+
+    const plan = st.rows.map(r => ({ id: r.id, name: r.name, from: r.class_name, ...nextClass(r.class_name) }));
+    const summary = {};
+    for (const p of plan) {
+      const key = p.from || 'ללא כיתה';
+      const to = !p.ok ? 'לא מזוהה – נשאר' : p.graduate ? 'מסיים – יושבת' : p.cls;
+      (summary[key] = summary[key] || { from: key, to, count: 0 }).count++;
+    }
+    const preview = { year, yearLabel: heb, already: done.rows.length ? done.rows[0].done_at : null,
+                      classes: Object.values(summary), total: plan.length };
+    if (req.body.dryRun) return res.json({ ok: true, ...preview });
+    if (done.rows.length) return res.status(400).json({ error: `מעבר השנה של ${heb} כבר בוצע` });
+
+    await pool.query(`INSERT INTO class_history (student_id, year, class_name)
+      SELECT id, $2, class_name FROM students WHERE teacher_id=$1
+      ON CONFLICT (student_id, year) DO NOTHING`, [tid, year]);
+    const graduated = [];
+    for (const p of plan) {
+      if (!p.ok) continue;
+      if (p.graduate) { graduated.push(p.id); continue; }
+      await pool.query('UPDATE students SET class_name=$1 WHERE id=$2 AND teacher_id=$3', [p.cls, p.id, tid]);
+    }
+    if (graduated.length) await pool.query('UPDATE students SET active = FALSE WHERE teacher_id=$1 AND id = ANY($2)', [tid, graduated]);
+    await pool.query('INSERT INTO year_transitions (teacher_id, year, graduated) VALUES ($1,$2,$3)', [tid, year, graduated]);
+    console.log(`[year-transition] teacher=${tid} year=${year} moved=${plan.filter(p => p.ok && !p.graduate).length} graduated=${graduated.length}`);
+    res.json({ ok: true, ...preview, graduated: graduated.length });
+  } catch (e) { console.error('[year-transition]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// כיתת ברירת מחדל בלוח (לכל משתמש)
+app.put('/api/teacher/default-class', auth, teacherOnly, async (req, res) => {
+  const cls = String(req.body.className || '').trim().slice(0, 20) || null;
+  try {
+    if (req.session.user_id === req.session.teacher_id)
+      await pool.query('UPDATE teachers SET default_class=$1 WHERE id=$2', [cls, req.session.teacher_id]);
+    else
+      await pool.query('UPDATE teacher_staff SET default_class=$1 WHERE id=$2 AND teacher_id=$3', [cls, req.session.user_id, req.session.teacher_id]);
+    res.json({ ok: true, className: cls });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // איפוס סיסמה של תלמיד ע"י המורה: סיסמה זמנית של 6 ספרות. הטלפון שכבר מחובר
